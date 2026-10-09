@@ -6142,7 +6142,11 @@ const file = e.target.files && e.target.files[0];
                     >
                       {r.username}
                     </button>
-                    {(!r.inFrom || !r.inTo) && <span className="tag">{!r.inFrom ? t('tag_new') : t('tag_left')}</span>}
+                    {fromDate !== toDate && (!r.inFrom || !r.inTo) && (
+                     <span className={`tag ${!r.inFrom ? 'tag-new' : 'tag-left'}`}>
+                       {!r.inFrom ? t('tag_new') : t('tag_left')}
+                     </span>
+                     )}
                   </span>
                   {visibleCols.power && <span className="dkp-baseline">{formatCount(r.power)}</span>}
                   {visibleCols.kp && <span className="dkp-baseline">{formatCount(r.kp)}</span>}
@@ -6274,9 +6278,11 @@ const file = e.target.files && e.target.files[0];
                 <div className="gov-identity">
                   <div className="gov-identity-name">
                     {cur.username}
-                    {(!a || !b) && (
-                      <span className="tag">{!a ? t('tag_new') : t('tag_left')}</span>
-                    )}
+{fromDate !== toDate && (!a || !b) && (
+  <span className={`tag ${!a ? 'tag-new' : 'tag-left'}`}>
+    {!a ? t('tag_new') : t('tag_left')}
+  </span>
+)}
                   </div>
                   <div className="gov-identity-id">{t('dkp_gov_id')}: {gid}</div>
                 </div>
@@ -8319,7 +8325,14 @@ function ActivityPanel() {
                     rows.slice(0, visibleCount).map((p, i) => (
                       <div className="act-row" key={p.id}>
                         <span className={`dkp-rank${i < 3 && !search.trim() ? ' top' + (i + 1) : ''}`}>{i + 1}</span>
-                        <span className="act-name" title={p.id}>{p.name}</span>
+                        <span className="act-name" title={p.id}>
+  {p.name}
+  {fromDate !== toDate && (!p.inFrom || !p.inTo) && (
+    <span className={`tag ${!p.inFrom ? 'tag-new' : 'tag-left'}`} style={{ marginLeft: 8 }}>
+      {!p.inFrom ? t('tag_new') : t('tag_left')}
+    </span>
+  )}
+</span>
                         <span className="act-num">{formatCount(p.helps)}</span>
                         <span className="act-num">{formatCount(p.resources)}</span>
                         <span className={`act-gained${p.helpsGained !== null && p.helpsGained < 0 ? ' neg' : ''}`}>{fmtGained(p.helpsGained)}</span>

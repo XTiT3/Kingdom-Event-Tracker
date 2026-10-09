@@ -9603,3 +9603,15 @@ html.lang-rtl .contact-card{
 @media (max-width: 380px){
   .brand-name{ display: none; }
 }
+
+/* ===== Migration marks: NEW / LEFT ===== */
+.tag.tag-new{
+  color:#7CF0DC;
+  background:linear-gradient(135deg, rgba(63,205,184,0.28) 0%, rgba(63,205,184,0.08) 100%);
+  border:1px solid rgba(63,205,184,0.6);
+}
+.tag.tag-left{
+  color:#FFB3BA;
+  background:linear-gradient(135deg, rgba(239,107,117,0.30) 0%, rgba(239,107,117,0.08) 100%);
+  border:1px solid rgba(239,107,117,0.6);
+}
