@@ -5480,6 +5480,90 @@ function OwnerProvider({ children }) {
   );
 }
 
+/* =====================================================================
+   MIGRATION TRACKING  (shared by the DKP tab and the Activity tab)
+   ---------------------------------------------------------------------
+   A governor's Character ID never changes when they migrate, no matter
+   which kingdom they come from or go to. So a governor's history is
+   rebuilt from WHICH SNAPSHOTS THEY APPEAR IN:
+     • absent in snapshot N-1, present in N  → migrated IN  on N's date
+     • present in N-1, absent in N           → migrated OUT on N's date
+   Gains are only counted for stretches where the governor was present in
+   consecutive snapshots (i.e. while they were in this kingdom), so KP /
+   power / deaths earned in another kingdom are never credited here.
+   Nothing extra is stored — it is derived from the snapshots, so it also
+   works retroactively for every file you have already uploaded.
+   ===================================================================== */
+function govDeaths(e) {
+  return e ? (e.t1d || 0) + (e.t2d || 0) + (e.t3d || 0) + (e.t4d || 0) + (e.t5d || 0) : 0;
+}
+
+// maps = { 'YYYY-MM-DD': { [id]: entry } }, dates = sorted ascending
+function trackGovernor(maps, dates, fromDate, toDate, id) {
+  const none = {
+    first: null, last: null, firstDate: null, lastDate: null,
+    hasBasis: false, events: [], joined: null, left: null,
+    gain: () => null,
+  };
+  let lo = dates.indexOf(fromDate);
+  let hi = dates.indexOf(toDate);
+  if (lo === -1 || hi === -1) return none;
+  if (lo > hi) { const x = lo; lo = hi; hi = x; }
+  const at = d => (maps[d] ? maps[d][id] : undefined);
+
+  // 1) migration events over the whole history up to the "To" snapshot
+  const events = [];
+  let prev = false;
+  for (let i = 0; i <= hi; i++) {
+    const here = !!at(dates[i]);
+    if (i > 0 && here !== prev) events.push({ type: here ? 'in' : 'out', date: dates[i] });
+    prev = here;
+  }
+
+  // 2) stretches (runs) where the governor was present inside the selected range
+  const runs = [];
+  let run = null;
+  for (let i = lo; i <= hi; i++) {
+    const e = at(dates[i]);
+    if (e) {
+      if (run) { run.endDate = dates[i]; run.end = e; }
+      else { run = { startDate: dates[i], start: e, endDate: dates[i], end: e }; runs.push(run); }
+    } else {
+      run = null;
+    }
+  }
+  if (runs.length === 0) return none;
+  const firstRun = runs[0];
+  const lastRun  = runs[runs.length - 1];
+  const loDate = dates[lo];
+  const hiDate = dates[hi];
+  const inRange = ev => ev.date > loDate && ev.date <= hiDate;
+  const joinedEv = events.filter(ev => ev.type === 'in'  && inRange(ev)).pop();
+  const leftEv   = events.filter(ev => ev.type === 'out' && inRange(ev)).pop();
+
+  return {
+    first: firstRun.start, firstDate: firstRun.startDate,
+    last:  lastRun.end,    lastDate:  lastRun.endDate,
+    hasBasis: lo === hi ? true : runs.some(r => r.startDate !== r.endDate),
+    events,
+    joined: joinedEv ? joinedEv.date : null,
+    left:   leftEv   ? leftEv.date   : null,
+    // Sum of (end - start) over every stretch spent in this kingdom.
+    // okAt(date) lets the caller skip stretches whose end-points lack the data
+    // (e.g. snapshots without death columns). Returns null if nothing counted.
+    gain: (fn, okAt) => {
+      let total = 0, counted = false;
+      runs.forEach(r => {
+        if (r.startDate === r.endDate && lo !== hi) return;
+        if (okAt && !(okAt(r.startDate) && okAt(r.endDate))) return;
+        total += fn(r.end) - fn(r.start);
+        counted = true;
+      });
+      return counted ? total : null;
+    },
+  };
+}
+
 function DkpPanel() {
   const { t } = useT();
   const { isOwner, requireOwnerLogin } = useOwner();
@@ -5675,14 +5759,21 @@ const file = e.target.files && e.target.files[0];
   const isKvkActive = fromIsKvk && toIsKvk;
 
   const rows = useMemo(() => {
-    const ids = new Set([...Object.keys(fromSnap), ...Object.keys(toSnap)]);
+    // every governor who appears in ANY snapshot between From and To (migrants included)
+    const lowD  = fromDate < toDate ? fromDate : toDate;
+    const highD = fromDate < toDate ? toDate : fromDate;
+    const ids = new Set();
+    dates.filter(d => d >= lowD && d <= highD).forEach(d => Object.keys(state.snapshots[d] || {}).forEach(gid => ids.add(gid)));
+    const deathsOkAt = d => !!(state.meta && state.meta[d] && state.meta[d].hasDeathData);
     const out = [];
     ids.forEach(id => {
-      const a = fromSnap[id];
-      const b = toSnap[id];
+      // migration-aware history: a = first appearance in range, b = last appearance in range
+      const trk = trackGovernor(state.snapshots, dates, fromDate, toDate, id);
+      const a = trk.first;
+      const b = trk.last;
       const cur = b || a;
       if (!cur) return;
-      const bothPresent = !!a && !!b;
+      // (bothPresent is no longer needed — trk.hasBasis / trk.gain() handle it)
       
       // Use the HIGHEST power between the two snapshots.
       // This ensures the DKP requirement automatically scales UP
@@ -5691,7 +5782,7 @@ const file = e.target.files && e.target.files[0];
       const powerB = b ? b.power : 0;
       const currentPower = Math.max(powerA, powerB);
       
-      const kpGained = bothPresent ? (b.kp - a.kp) : null;
+      const kpGained = trk.gain(e => e.kp);
 
       /* -------------------------------------------------------------
          KVK DKP CALCULATION — ENEMY KINGDOMS ONLY
@@ -5749,11 +5840,9 @@ const file = e.target.files && e.target.files[0];
       // Deaths gained — positive values only, and only when both snapshots
       // actually carried death columns.
       let deathsPart = 0;
-      if (isKvkFile && bothPresent && deathGainedAvailable) {
-        const deathsDelta =
-          (b.t1d - a.t1d) + (b.t2d - a.t2d) + (b.t3d - a.t3d) +
-          (b.t4d - a.t4d) + (b.t5d - a.t5d);
-        if (deathsDelta > 0) deathsPart = deathsDelta;
+      const deathsGainedRow = trk.gain(govDeaths, deathsOkAt);
+      if (isKvkFile && deathsGainedRow !== null && deathsGainedRow > 0) {
+        deathsPart = deathsGainedRow;
       }
 
       // DKP earned = KP gained + deaths gained. That's it.
@@ -5772,20 +5861,20 @@ const file = e.target.files && e.target.files[0];
         id,
         username: cur.username,
         power: currentPower,
-        powerGained: bothPresent ? (b.power - a.power) : null,
+        powerGained: trk.gain(e => e.power),
         kp: b ? b.kp : (a ? a.kp : 0),
         kpGained,
-        resourcesGained: bothPresent ? (b.resources - a.resources) : null,
-        deaths: deathTotalAvailable ? ((cur.t1d || 0) + (cur.t2d || 0) + (cur.t3d || 0) + (cur.t4d || 0) + (cur.t5d || 0)) : null,
-        deathsGained: (bothPresent && deathGainedAvailable)
-          ? ((b.t1d - a.t1d) + (b.t2d - a.t2d) + (b.t3d - a.t3d) + (b.t4d - a.t4d) + (b.t5d - a.t5d))
-          : null,
+        resourcesGained: trk.gain(e => e.resources),
+        deaths: deathsOkAt(trk.lastDate) ? govDeaths(cur) : null,
+        deathsGained: deathsGainedRow,
         dkpEarned,
         dkpRequired,
         dkpProgressPct,
         isKvkFile,      // handy for debugging / future use
-        inFrom: !!a,
-        inTo: !!b,
+        inFrom: !!fromSnap[id],
+        inTo: !!toSnap[id],
+        hasBasis: trk.hasBasis,                              // has at least 2 snapshots while in this kingdom
+        mig: { joined: trk.joined, left: trk.left },         // migration dates inside the selected range
       });
     });
     const q = search.trim().toLowerCase();
@@ -5799,13 +5888,13 @@ const file = e.target.files && e.target.files[0];
       if (xv === yv) return 0;
       return (yv > xv ? 1 : -1) * dir;
     });
-  }, [fromSnap, toSnap, search, sortKey, sortDir, deathTotalAvailable, deathGainedAvailable, isKvkActive]);
+  }, [state, dates, fromDate, toDate, fromSnap, toSnap, search, sortKey, sortDir, deathTotalAvailable, deathGainedAvailable, isKvkActive]);
 
   const visibleRows = useMemo(() => rows.slice(0, visibleCount), [rows, visibleCount]);
 
   const summary = useMemo(() => {
     if (rows.length === 0) return null;
-    const active = rows.filter(r => r.inFrom && r.inTo);
+    const active = rows.filter(r => r.hasBasis);
     const totalKpGained = rows.reduce((s, r) => s + (r.kpGained || 0), 0);
     const totalPowerGained = rows.reduce((s, r) => s + (r.powerGained || 0), 0);
     const totalDeadGained = deathGainedAvailable
@@ -5827,7 +5916,7 @@ const file = e.target.files && e.target.files[0];
 
     // Only governors present in both snapshots qualify for "gained" categories.
     const isGained = sortKey === 'kpGained' || sortKey === 'powerGained' || sortKey === 'deathsGained';
-    const pool = isGained ? rows.filter(r => r.inFrom && r.inTo) : rows;
+    const pool = isGained ? rows.filter(r => r.hasBasis) : rows;
 
     // Is this category actually available? (deaths may be missing from files)
     if (sortKey === 'deathsGained' && !deathGainedAvailable) return null;
@@ -6142,11 +6231,12 @@ const file = e.target.files && e.target.files[0];
                     >
                       {r.username}
                     </button>
-                    {fromDate !== toDate && (!r.inFrom || !r.inTo) && (
-                     <span className={`tag ${!r.inFrom ? 'tag-new' : 'tag-left'}`}>
-                       {!r.inFrom ? t('tag_new') : t('tag_left')}
-                     </span>
-                     )}
+                    {fromDate !== toDate && r.mig.joined && (
+                      <span className="tag tag-new" title={r.mig.joined}>{t('tag_new')} · {r.mig.joined}</span>
+                    )}
+                    {fromDate !== toDate && r.mig.left && (
+                      <span className="tag tag-left" title={r.mig.left}>{t('tag_left')} · {r.mig.left}</span>
+                    )}
                   </span>
                   {visibleCols.power && <span className="dkp-baseline">{formatCount(r.power)}</span>}
                   {visibleCols.kp && <span className="dkp-baseline">{formatCount(r.kp)}</span>}
@@ -6227,12 +6317,12 @@ const file = e.target.files && e.target.files[0];
       {/* Governor details modal — opens when you tap/click a name */}
       {selectedGovernor && (() => {
         const gid = selectedGovernor.id;
-        const a = fromSnap[gid];      // entry in the "From" snapshot (may be undefined)
-        const b = toSnap[gid];        // entry in the "To" snapshot   (may be undefined)
+        const trk = trackGovernor(state.snapshots, dates, fromDate, toDate, gid);
+        const mDeathsOk = d => !!(state.meta && state.meta[d] && state.meta[d].hasDeathData);
+        const a = trk.first;          // first appearance inside the selected range
+        const b = trk.last;           // last appearance inside the selected range
         const cur = b || a;
         if (!cur) return null;
-
-        const both = !!a && !!b;
         const deathsOf = (s) =>
           s ? ((s.t1d || 0) + (s.t2d || 0) + (s.t3d || 0) + (s.t4d || 0) + (s.t5d || 0)) : null;
 
@@ -6242,25 +6332,25 @@ const file = e.target.files && e.target.files[0];
             label: t('col_power'),
             from: a ? a.power : null,
             to:   b ? b.power : null,
-            gained: both ? (b.power - a.power) : null,
+            gained: trk.gain(e => e.power),
           },
           {
             key: 'kp',
             label: t('col_kp'),
             from: a ? a.kp : null,
             to:   b ? b.kp : null,
-            gained: both ? (b.kp - a.kp) : null,
+            gained: trk.gain(e => e.kp),
           },
         ];
 
         // Only add the Deaths row when we actually have death data.
-        if (deathTotalAvailable || (both && deathGainedAvailable)) {
+        if ((b && mDeathsOk(trk.lastDate)) || (a && mDeathsOk(trk.firstDate))) {
           rows.push({
             key: 'deaths',
             label: t('col_dead'),
-            from: (a && fromHasDeaths) ? deathsOf(a) : null,
-            to:   (b && toHasDeaths)   ? deathsOf(b) : null,
-            gained: (both && deathGainedAvailable) ? (deathsOf(b) - deathsOf(a)) : null,
+            from: (a && mDeathsOk(trk.firstDate)) ? deathsOf(a) : null,
+            to:   (b && mDeathsOk(trk.lastDate))  ? deathsOf(b) : null,
+            gained: trk.gain(deathsOf, mDeathsOk),
           });
         }
 
@@ -6278,21 +6368,37 @@ const file = e.target.files && e.target.files[0];
                 <div className="gov-identity">
                   <div className="gov-identity-name">
                     {cur.username}
-{fromDate !== toDate && (!a || !b) && (
-  <span className={`tag ${!a ? 'tag-new' : 'tag-left'}`}>
-    {!a ? t('tag_new') : t('tag_left')}
-  </span>
-)}
+                    {fromDate !== toDate && trk.joined && (
+                     <span className="tag tag-new">{t('tag_new')} · {trk.joined}</span>
+                    )}
+                    {fromDate !== toDate && trk.left && (
+                     <span className="tag tag-left">{t('tag_left')} · {trk.left}</span>
+                    )}
                   </div>
                   <div className="gov-identity-id">{t('dkp_gov_id')}: {gid}</div>
+                  {trk.events.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                      {trk.events.map((ev, i) => (
+                        <span key={i} className={`tag ${ev.type === 'in' ? 'tag-new' : 'tag-left'}`}>
+                          {ev.type === 'in' ? t('tag_new') : t('tag_left')} · {ev.date}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 {/* Comparison table — what changed between snapshots */}
                 <div className="gov-table">
                   <div className="gov-table-head">
                     <span></span>
-                    <span title={fromDate}>{t('from_label')}</span>
-                    <span title={toDate}>{t('to_label')}</span>
+                    <span title={trk.firstDate || fromDate}>
+                      {t('from_label')}
+                      {trk.firstDate && trk.firstDate !== fromDate && <small style={{ display: 'block', opacity: 0.7, fontWeight: 400 }}>{trk.firstDate}</small>}
+                    </span>
+                    <span title={trk.lastDate || toDate}>
+                      {t('to_label')}
+                      {trk.lastDate && trk.lastDate !== toDate && <small style={{ display: 'block', opacity: 0.7, fontWeight: 400 }}>{trk.lastDate}</small>}
+                    </span>
                     <span>{t('dkp_gov_change')}</span>
                   </div>
 
@@ -8029,6 +8135,16 @@ function ActivityPanel() {
 
   const dates = useMemo(() => Object.keys(snapshots).sort(), [snapshots]);
 
+  // { date: { id: player } } so the migration tracker can look a player up on any date
+  const playerMaps = useMemo(() => {
+    const m = {};
+    Object.keys(snapshots).forEach(d => {
+      const arr = snapshots[d] && Array.isArray(snapshots[d].players) ? snapshots[d].players : [];
+      m[d] = Object.fromEntries(arr.map(p => [p.id, p]));
+    });
+    return m;
+  }, [snapshots]);
+
   // Auto-select sensible From / To defaults whenever the snapshot list changes
   useEffect(() => {
     if (dates.length === 0) return;
@@ -8063,23 +8179,28 @@ function ActivityPanel() {
   }, [snapshots, toDate]);
 
   const rows = useMemo(() => {
-    const ids = new Set([...Object.keys(fromPlayers), ...Object.keys(toPlayers)]);
+    // every player who appears in ANY snapshot between From and To (migrants included)
+    const lowD = fromDate < toDate ? fromDate : toDate;
+    const highD = fromDate < toDate ? toDate : fromDate;
+    const ids = new Set();
+    dates.filter(d => d >= lowD && d <= highD).forEach(d => Object.keys(playerMaps[d] || {}).forEach(pid => ids.add(pid)));
     const out = [];
     ids.forEach(id => {
-      const a = fromPlayers[id];
-      const b = toPlayers[id];
+      const trk = trackGovernor(playerMaps, dates, fromDate, toDate, id);
+      const a = trk.first;   // first appearance in range
+      const b = trk.last;    // last appearance in range
       const cur = b || a;
       if (!cur) return;
-      const both = !!a && !!b;
       out.push({
         id,
         name: cur.name,
         helps: b ? (b.helps || 0) : (a ? (a.helps || 0) : 0),
         resources: b ? (b.resources || 0) : (a ? (a.resources || 0) : 0),
-        helpsGained:     both ? ((b.helps || 0) - (a.helps || 0)) : null,
-        resourcesGained: both ? ((b.resources || 0) - (a.resources || 0)) : null,
-        inFrom: !!a,
-        inTo: !!b,
+        helpsGained:     trk.gain(e => e.helps || 0),
+        resourcesGained: trk.gain(e => e.resources || 0),
+        inFrom: !!fromPlayers[id],
+        inTo: !!toPlayers[id],
+        mig: { joined: trk.joined, left: trk.left },
       });
     });
     const q = search.trim().toLowerCase();
@@ -8090,7 +8211,7 @@ function ActivityPanel() {
       if (xv === yv) return 0;
       return yv > xv ? 1 : -1;
     });
-  }, [fromPlayers, toPlayers, search, sortKey]);
+  }, [playerMaps, dates, fromDate, toDate, fromPlayers, toPlayers, search, sortKey]);
 
   const totals = useMemo(() => ({
     players:   rows.length,
@@ -8326,13 +8447,14 @@ function ActivityPanel() {
                       <div className="act-row" key={p.id}>
                         <span className={`dkp-rank${i < 3 && !search.trim() ? ' top' + (i + 1) : ''}`}>{i + 1}</span>
                         <span className="act-name" title={p.id}>
-  {p.name}
-  {fromDate !== toDate && (!p.inFrom || !p.inTo) && (
-    <span className={`tag ${!p.inFrom ? 'tag-new' : 'tag-left'}`} style={{ marginLeft: 8 }}>
-      {!p.inFrom ? t('tag_new') : t('tag_left')}
-    </span>
-  )}
-</span>
+                        {p.name}
+                        {fromDate !== toDate && p.mig.joined && (
+                          <span className="tag tag-new" style={{ marginLeft: 8 }} title={p.mig.joined}>{t('tag_new')} · {p.mig.joined}</span>
+                        )}
+                        {fromDate !== toDate && p.mig.left && (
+                          <span className="tag tag-left" style={{ marginLeft: 8 }} title={p.mig.left}>{t('tag_left')} · {p.mig.left}</span>
+                        )}
+                        </span>
                         <span className="act-num">{formatCount(p.helps)}</span>
                         <span className="act-num">{formatCount(p.resources)}</span>
                         <span className={`act-gained${p.helpsGained !== null && p.helpsGained < 0 ? ' neg' : ''}`}>{fmtGained(p.helpsGained)}</span>
