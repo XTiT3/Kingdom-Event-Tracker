@@ -574,6 +574,10 @@ const TRANSLATIONS = {
     dkp_desc2:"Snapshots are recorded before and after KvK battles to measure each governor's progress across the kingdom.",
     dkp_desc3:"Select two snapshots below to see how much each governor gained in power, kills, and more.",
     dkp_top_title:"Top Performer",
+    dkp_range_label:"Player Range",
+    dkp_range_players:"Players",
+    dkp_range_stat_label:"Statistic",
+    dkp_range_total:"Combined Total",
     dkp_top_note:"The governor with the highest selected stat.",
     dkp_gov_modal_title:"Governor Details",
     dkp_gov_id:"ID",
@@ -5892,6 +5896,18 @@ const file = e.target.files && e.target.files[0];
 
   const visibleRows = useMemo(() => rows.slice(0, visibleCount), [rows, visibleCount]);
 
+  /* ---------- Player range total ---------- */
+  const [rangeKey, setRangeKey]   = useState('1-300');
+  const [rangeStat, setRangeStat] = useState('power');
+
+  const rangeTotal = useMemo(() => {
+    const ranges = { '1-300': [1, 300], '301-600': [301, 600], '1-600': [1, 600] };
+    const [from, to] = ranges[rangeKey] || ranges['1-300'];
+    const slice = rows.slice(from - 1, to);
+    const total = slice.reduce((s, r) => s + (Number(r[rangeStat]) || 0), 0);
+    return { total, count: slice.length };
+  }, [rows, rangeKey, rangeStat]);
+
   const summary = useMemo(() => {
     if (rows.length === 0) return null;
     const active = rows.filter(r => r.hasBasis);
@@ -6116,6 +6132,57 @@ const file = e.target.files && e.target.files[0];
                 value={search}
                 onChange={e => setSearch(e.target.value)}
               />
+            </div>
+          </div>
+
+          <div className="dkp-scan-card">
+            <div className="dkp-scan-actions" style={{ flexWrap: 'wrap' }}>
+              <label className="muted-line" style={{ margin: 0 }}>
+                {t('dkp_range_label')}{' '}
+                <select
+                  className="dkp-name-input"
+                  style={{ display: 'inline-block', width: 'auto' }}
+                  value={rangeKey}
+                  onChange={e => setRangeKey(e.target.value)}
+                >
+                  <option value="1-300">{t('dkp_range_players')} 1–300</option>
+                  <option value="301-600">{t('dkp_range_players')} 301–600</option>
+                  <option value="1-600">{t('dkp_range_players')} 1–600</option>
+                </select>
+              </label>
+              <label className="muted-line" style={{ margin: 0 }}>
+                {t('dkp_range_stat_label')}{' '}
+                <select
+                  className="dkp-name-input"
+                  style={{ display: 'inline-block', width: 'auto' }}
+                  value={rangeStat}
+                  onChange={e => setRangeStat(e.target.value)}
+                >
+                  <option value="power">{t('col_power')}</option>
+                  <option value="kp">{t('col_kp')}</option>
+                  <option value="deaths">{t('col_dead')}</option>
+                  <option value="powerGained">{t('col_power_gained')}</option>
+                  <option value="kpGained">{t('col_kp_gained')}</option>
+                  <option value="deathsGained">{t('col_dead_gained')}</option>
+                  <option value="dkpEarned">{t('dkp_earned')}</option>
+                  <option value="resourcesGained">{t('activity_col_resources_gained')}</option>
+                </select>
+              </label>
+            </div>
+
+            <div className="dkp-summary-grid" style={{ marginTop: 14 }}>
+              <div className="dkp-summary-card dkp-summary-top">
+                <span className="dkp-summary-label">
+                  {t('dkp_range_total')} · {t('dkp_range_players')} {rangeKey.replace('-', '–')}
+                </span>
+                <span className="dkp-summary-value accent">
+                  {['powerGained', 'kpGained', 'deathsGained', 'resourcesGained'].includes(rangeStat) && rangeTotal.total >= 0 ? '+' : ''}
+                  {formatCount(rangeTotal.total)}
+                </span>
+                <span className="dkp-summary-sub">
+                  {formatCount(rangeTotal.count)} {t('activity_players')}
+                </span>
+              </div>
             </div>
           </div>
 
