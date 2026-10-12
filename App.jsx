@@ -10581,6 +10581,26 @@ const MigrationIcon = p => (
 
 const OUR_KINGDOM_ID = '4161';
 const MIG_VERDICT_URL = 'https://xtit-dkp-tracker-default-rtdb.firebaseio.com/migration_verdicts';
+const MIG_LOG_URL = 'https://xtit-dkp-tracker-default-rtdb.firebaseio.com/migration_log.json';
+
+async function loadMigrationLog() {
+  try {
+    const res = await fetch(MIG_LOG_URL, { cache: 'no-store' });
+    if (!res.ok) throw new Error('log fetch failed');
+    const d = await res.json();
+    return d && typeof d === 'object' ? d : {};
+  } catch (e) { return null; }
+}
+async function saveMigrationLog(log) {
+  try {
+    const res = await fetch(MIG_LOG_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(log),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
 
 async function loadMigrationVerdicts() {
   try {
@@ -10657,6 +10677,20 @@ function MigrationPanel() {
   }, [dates]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { setVisibleCount(50); }, [view, fromDate, toDate, search, sortBy]);
+
+  // Permanent migration log (kept even if a snapshot is later deleted)
+  const [migLog, setMigLog] = useState({});
+  const migLogLoadedRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const l = await loadMigrationLog();
+      if (!cancelled && l) { setMigLog(l); migLogLoadedRef.current = true; }
+    };
+    load();
+    const id = setInterval(load, DKP_POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   /* OLD DUPLICATE BLOCK — disabled
   // Compare every pair of consecutive snapshots.
@@ -10860,10 +10894,44 @@ function MigrationPanel() {
   const lowD  = fromDate && toDate ? (fromDate < toDate ? fromDate : toDate) : '';
   const highD = fromDate && toDate ? (fromDate < toDate ? toDate : fromDate) : '';
 
+  // Automatically save every comparison to the permanent log (owner session, so
+  // the log is written right after an upload). Existing records are never removed.
+  useEffect(() => {
+    if (!isOwner || !migLogLoadedRef.current || transitions.length === 0) return;
+    const sigOf = list => JSON.stringify((list || []).map(e => e.key + '|' + e.kind).sort());
+    const next = { ...migLog };
+    let changed = false;
+    transitions.forEach(tr => {
+      const old = migLog[tr.date];
+      const oldEvents = old && old.events ? Object.values(old.events) : [];
+      if (!old || sigOf(tr.events) !== sigOf(oldEvents)) { next[tr.date] = tr; changed = true; }
+    });
+    if (changed) { setMigLog(next); saveMigrationLog(next); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transitions, isOwner]);
+
+  // Live comparisons + saved history for dates whose snapshot no longer exists
+  const fullHistory = useMemo(() => {
+    const liveDates = new Set(transitions.map(tr => tr.date));
+    const kept = Object.values(migLog || {})
+      .filter(tr => tr && tr.date && !liveDates.has(tr.date))
+      .map(tr => {
+        const evs = tr.events ? Object.values(tr.events) : [];
+        return {
+          ...tr,
+          events: evs,
+          joined: evs.filter(e => e.kind === 'join').length,
+          left: evs.filter(e => e.kind !== 'join').length,
+          unconfirmed: evs.filter(e => e.kind === 'unconfirmed').length,
+        };
+      });
+    return [...transitions, ...kept].sort((a, b) => a.date.localeCompare(b.date));
+  }, [transitions, migLog]);
+
   // Date filter: every comparison that happened between the selected dates
   const rangeTransitions = useMemo(
-    () => transitions.filter(tr => tr.date > lowD && tr.date <= highD),
-    [transitions, lowD, highD]
+    () => fullHistory.filter(tr => tr.date > lowD && tr.date <= highD),
+    [fullHistory, lowD, highD]
   );
   const events = useMemo(() => {
     if (!lowD || !highD || lowD === highD) return [];
