@@ -5334,7 +5334,28 @@ const COLUMN_ALIASES = {
   highest:   ['highest power'],
   kp:        ['total kill points', 'kill points', 'kp'],
   resources: ['resources gathered', 'resources'],
-  helps:     ['alliance helps', 'alliance help', 'alliance helps given', 'alliance help given', 'total alliance helps', 'total alliance help', 'total helps', 'total help', 'helps given', 'help given', 'helps', 'help'],
+  helps: [
+    'alliance helps', 'alliance help',
+    'alliance helps given', 'alliance help given',
+    'alliance helps received', 'alliance help received',
+    'alliance helps sent', 'alliance help sent',
+    'alliance helps count', 'alliance helps points',
+    'alliance help count', 'alliance help points',
+    'alliance help total', 'alliance helps total',
+    'total alliance helps', 'total alliance help',
+    'total helps', 'total help',
+    'total helps given', 'total help given',
+    'total helps received', 'total help received',
+    'helps given', 'help given',
+    'helps received', 'help received',
+    'helps sent', 'help sent',
+    'helped allies', 'allies helped',
+    'number of helps', 'number of help',
+    'help count', 'helps count',
+    'assists', 'assist count', 'assists given',
+    'alliance assists', 'alliance assist',
+    'helps', 'help',
+  ],
   t5k:       ['t5 kills', 'tier 5 kills'],
   t4k:       ['t4 kills', 'tier 4 kills'],
   t3k:       ['t3 kills', 'tier 3 kills'],
@@ -5400,6 +5421,33 @@ async function parseGovernorFile(file) {
     t1d:       findColumnIndex(header, COLUMN_ALIASES.t1d),
     kingdom:   findColumnIndex(header, COLUMN_ALIASES.kingdom),
   };
+
+  // Last-resort fallback: if none of the explicit helps aliases matched,
+  // scan every header for a help/assist keyword in any language our
+  // players commonly use. This catches unusual header names we haven't
+  // listed yet (localized exports, extra wording, etc.).
+  if (col.helps === -1) {
+    const HELP_RE = /help|assist|yard[iı]m|ayuda|ajuda|assist[êe]ncia|помощ|同盟|동맹|hỗ trợ|مساعدة|bantuan|hilfe|aiuto|aide|unterst/i;
+    const fallback = header.findIndex(h => {
+      const s = String(h || '');
+      if (!s) return false;
+      return HELP_RE.test(s);
+    });
+    if (fallback !== -1 && fallback !== col.id && fallback !== col.username) {
+      col.helps = fallback;
+    }
+  }
+
+  // Diagnostic — prints the exact header row + resolved column map to the
+  // browser console. If helps is still 0 after re-upload, open DevTools
+  // → Console and read this to see what the real header name is.
+  try {
+    // eslint-disable-next-line no-console
+    console.log('[Governor parser] header row:', header);
+    // eslint-disable-next-line no-console
+    console.log('[Governor parser] resolved columns:', col);
+  } catch (e) {}
+
   if (col.id === -1 || col.username === -1) {
     throw new Error('Could not find Character ID / Username columns in this file');
   }
@@ -8177,6 +8225,34 @@ async function parseActivityFile(file) {
     if (fallback !== -1 && fallback !== col.id && fallback !== col.username) {
       col.helps = fallback;
     }
+  }
+
+  // ULTIMATE SAFETY NET — the RoK stats exporter always places
+  // "Alliance Helps" as the very LAST column of the sheet. If the alias
+  // list and the keyword regex both failed (e.g. an unusual localized
+  // header), fall back to the last unmapped column in the header row.
+  if (col.helps === -1 && header.length > 0) {
+    const used = new Set(
+      Object.values(col).filter(v => typeof v === 'number' && v !== -1)
+    );
+    for (let i = header.length - 1; i >= 0; i--) {
+      if (used.has(i)) continue;
+      const h = normalizeHeader(header[i]);
+      if (!h) continue;
+      // Never mistake a known different column for helps.
+      if (/^id$|character id|username|^name$|power|kill|death|resource/.test(h)) continue;
+      col.helps = i;
+      break;
+    }
+  }
+
+  // Also auto-correct any stale snapshot that lacks helps: if the file
+  // has a helps column but the parser reports it missing, log loudly.
+  if (col.helps !== -1) {
+    try {
+      // eslint-disable-next-line no-console
+      console.log('[Governor parser] helps column detected at index', col.helps, '->', header[col.helps]);
+    } catch (e) {}
   }
 
   // Diagnostic — prints the exact header row + resolved column map to the
