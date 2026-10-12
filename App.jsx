@@ -11075,8 +11075,13 @@ function MigrationPanel() {
             <>
               <label className="muted-line" style={{ margin: 0 }}>
                 {t('sort_label')}{' '}
-                <select className="dkp-name-input" style={{ display: 'inline-block', width: 'auto' }} value="power-desc" disabled>
+                <select className="dkp-name-input" style={{ display: 'inline-block', width: 'auto' }} value={sortBy} onChange={e => setSortBy(e.target.value)}>
                   <option value="power-desc">{t('mig_sort_power_hl')}</option>
+                  <option value="power-asc">{t('mig_sort_power_lh')}</option>
+                  <option value="date-desc">{t('mig_sort_new')}</option>
+                  <option value="date-asc">{t('mig_sort_old')}</option>
+                  <option value="name-asc">{t('mig_sort_name_az')}</option>
+                  <option value="name-desc">{t('mig_sort_name_za')}</option>
                 </select>
               </label>
               <input
