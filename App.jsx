@@ -477,8 +477,15 @@ const TRANSLATIONS = {
     mig_tab_joined:"Joined",
     mig_tab_left:"Left",
     mig_tab_history:"History",
-    mig_joined:"Players Joined",
-    mig_left:"Players Left",
+    mig_joined:"Joined Kingdom",
+    mig_left:"Left Kingdom (Confirmed)",
+    mig_unconfirmed:"Unconfirmed Departures",
+    mig_tab_unconfirmed:"Unconfirmed",
+    mig_tag_unconfirmed:"Unconfirmed",
+    mig_confirm_left:"Confirm left kingdom",
+    mig_still_here:"Still in kingdom",
+    mig_unconfirmed_note:"Missing from our latest kingdom data, but nothing proves they left the kingdom. Not included in the confirmed totals.",
+    mig_note_v2:"Leaving an alliance is not leaving the kingdom. A player counts as Left Kingdom only if a later snapshot lists them under another kingdom (Kingdom column) or the owner confirmed it. Players who simply disappear from the files are Unconfirmed, and players who reappear in a later file are ignored. The files contain no alliance, city or destination-kingdom data, so add a Kingdom column to the exports for automatic confirmation.",
     mig_net:"Net Migration",
     mig_total:"Total Migration Activity",
     mig_unique:"unique players",
@@ -5326,6 +5333,7 @@ const COLUMN_ALIASES = {
   t3d:       ['t3 deaths', 'tier 3 deaths'],
   t2d:       ['t2 deaths', 'tier 2 deaths'],
   t1d:       ['t1 deaths', 'tier 1 deaths'],
+  kingdom:   ['kingdom', 'home kingdom', 'kingdom id'],
 };
 
 function normalizeHeader(h) {
@@ -5376,6 +5384,7 @@ async function parseGovernorFile(file) {
     t3d:       findColumnIndex(header, COLUMN_ALIASES.t3d),
     t2d:       findColumnIndex(header, COLUMN_ALIASES.t2d),
     t1d:       findColumnIndex(header, COLUMN_ALIASES.t1d),
+    kingdom:   findColumnIndex(header, COLUMN_ALIASES.kingdom),
   };
   if (col.id === -1 || col.username === -1) {
     throw new Error('Could not find Character ID / Username columns in this file');
@@ -5383,7 +5392,7 @@ async function parseGovernorFile(file) {
 
   const CRITICAL_COLUMNS = ['power', 'kp'];
   const allMissing = Object.entries(col)
-    .filter(([key, idx]) => idx === -1 && key !== 'id' && key !== 'username')
+    .filter(([key, idx]) => idx === -1 && key !== 'id' && key !== 'username' && key !== 'kingdom')
     .map(([key]) => key);
   const missingCritical = allMissing.filter(k => CRITICAL_COLUMNS.includes(k));
   const missingOptional = allMissing.filter(k => !CRITICAL_COLUMNS.includes(k));
@@ -5415,6 +5424,7 @@ async function parseGovernorFile(file) {
       t3d:       col.t3d       !== -1 ? toNum(r[col.t3d])       : 0,
       t2d:       col.t2d       !== -1 ? toNum(r[col.t2d])       : 0,
       t1d:       col.t1d       !== -1 ? toNum(r[col.t1d])       : 0,
+      kingdom:   col.kingdom   !== -1 ? String(r[col.kingdom] ?? '').trim() : '',
     };
   }
   if (Object.keys(governors).length === 0) throw new Error('No governor rows found in this file');
@@ -10563,8 +10573,51 @@ const MigrationIcon = p => (
   </svg>
 );
 
+const OUR_KINGDOM_ID = '4161';
+const MIG_VERDICT_URL = 'https://xtit-dkp-tracker-default-rtdb.firebaseio.com/migration_verdicts';
+
+async function loadMigrationVerdicts() {
+  try {
+    const res = await fetch(MIG_VERDICT_URL + '.json', { cache: 'no-store' });
+    if (!res.ok) throw new Error('verdict fetch failed');
+    const d = await res.json();
+    return d && typeof d === 'object' ? d : {};
+  } catch (e) { return null; }
+}
+async function saveMigrationVerdict(id, verdict) {
+  try {
+    const res = await fetch(`${MIG_VERDICT_URL}/${encodeURIComponent(id)}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(verdict),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+// A snapshot entry counts as "foreign" only if it explicitly names another kingdom.
+function isForeignKingdom(entry) {
+  const k = String((entry && entry.kingdom) || '').replace(/\D/g, '');
+  return !!k && k !== OUR_KINGDOM_ID;
+}
+
 function MigrationPanel() {
   const { t } = useT();
+  const { isOwner } = useOwner();
+  const [verdicts, setVerdicts]   = useState({});   // { [id]: 'left' | 'stayed' }
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const v = await loadMigrationVerdicts();
+      if (!cancelled && v) setVerdicts(v);
+    };
+    load();
+    const id = setInterval(load, DKP_POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+  const setVerdict = async (id, verdict) => {
+    setVerdicts(v => ({ ...v, [id]: verdict }));
+    await saveMigrationVerdict(id, verdict);
+  };
   const [snapshots, setSnapshots] = useState({});
   const [loaded, setLoaded]       = useState(false);
   const [failed, setFailed]       = useState(false);
@@ -10599,30 +10652,62 @@ function MigrationPanel() {
 
   useEffect(() => { setVisibleCount(50); }, [view, fromDate, toDate, search, sortBy]);
 
-  // Compare every pair of consecutive snapshots
+  // Compare every pair of consecutive snapshots.
+  // kind: 'join' | 'left' (confirmed kingdom departure) | 'unconfirmed' (missing, not provable)
   const transitions = useMemo(() => {
     const out = [];
+    const laterEntries = (id, idx) => {
+      const list = [];
+      for (let j = idx + 1; j < dates.length; j++) {
+        const en = (snapshots[dates[j]] || {})[id];
+        if (en) list.push(en);
+      }
+      return list;
+    };
+    const seenEarlier = (id, idx) => {
+      for (let j = 0; j < idx - 1; j++) if ((snapshots[dates[j]] || {})[id]) return true;
+      return false;
+    };
     for (let i = 1; i < dates.length; i++) {
       const prev = snapshots[dates[i - 1]] || {};
       const cur  = snapshots[dates[i]] || {};
-      const events = [];
+      const raw = [];
       Object.keys(cur).forEach(id => {
-        if (!prev[id]) events.push({ type: 'join', id, name: cur[id].username, power: cur[id].power || 0, date: dates[i], since: dates[i - 1] });
+        if (!prev[id]) raw.push({ type: 'join', id, name: cur[id].username, power: cur[id].power || 0 });
       });
       Object.keys(prev).forEach(id => {
-        if (!cur[id]) events.push({ type: 'left', id, name: prev[id].username, power: prev[id].power || 0, date: dates[i], since: dates[i - 1] });
+        if (!cur[id]) raw.push({ type: 'left', id, name: prev[id].username, power: prev[id].power || 0 });
       });
       const base = Math.max(Object.keys(prev).length, Object.keys(cur).length, 1);
-      const suspect = events.length / base > 0.2;
-      events.forEach(e => { e.suspect = suspect; e.key = e.id + '|' + e.type + '|' + e.date; });
+      const suspect = raw.length / base > 0.2;
+      const events = [];
+      raw.forEach(e => {
+        const verdict = verdicts[e.id];
+        if (e.type === 'join') {
+          // Seen in an earlier snapshot = coming back after a gap in the files, not a migration
+          if (seenEarlier(e.id, i) && verdict !== 'left') return;
+          e.kind = 'join';
+        } else {
+          if (verdict === 'stayed') return;                       // owner says still in kingdom
+          const later = laterEntries(e.id, i);
+          if (verdict === 'left' || later.some(isForeignKingdom)) e.kind = 'left';
+          else if (later.length > 0) return;                      // still in our data later -> not a departure
+          else e.kind = 'unconfirmed';
+        }
+        events.push({
+          ...e, date: dates[i], since: dates[i - 1], suspect,
+          key: e.id + '|' + e.type + '|' + dates[i],
+        });
+      });
       out.push({
         date: dates[i], since: dates[i - 1], events, suspect,
-        joined: events.filter(e => e.type === 'join').length,
-        left:   events.filter(e => e.type === 'left').length,
+        joined:      events.filter(e => e.kind === 'join').length,
+        left:        events.filter(e => e.kind === 'left').length,
+        unconfirmed: events.filter(e => e.kind === 'unconfirmed').length,
       });
     }
     return out;
-  }, [snapshots, dates]);
+  }, [snapshots, dates, verdicts]);
 
   const lowD  = fromDate && toDate ? (fromDate < toDate ? fromDate : toDate) : '';
   const highD = fromDate && toDate ? (fromDate < toDate ? toDate : fromDate) : '';
@@ -10634,10 +10719,11 @@ function MigrationPanel() {
   const events = useMemo(() => rangeTransitions.flatMap(tr => tr.events), [rangeTransitions]);
 
   const stats = useMemo(() => {
-    const joined = events.filter(e => e.type === 'join').length;
-    const left   = events.filter(e => e.type === 'left').length;
+    const joined = events.filter(e => e.kind === 'join').length;
+    const left   = events.filter(e => e.kind === 'left').length;
+    const unconfirmed = events.filter(e => e.kind === 'unconfirmed').length;
     return {
-      joined, left,
+      joined, left, unconfirmed,
       net: joined - left,
       total: joined + left,
       unique: new Set(events.map(e => e.id)).size,
@@ -10663,7 +10749,7 @@ function MigrationPanel() {
   const listFor = (type) => {
     const q = search.trim().toLowerCase();
     return events
-      .filter(e => e.type === type && (!q || String(e.name || '').toLowerCase().includes(q) || String(e.id).includes(q)))
+      .filter(e => e.kind === type && (!q || String(e.name || '').toLowerCase().includes(q) || String(e.id).includes(q)))
       .sort(sortFn);
   };
 
@@ -10689,11 +10775,21 @@ function MigrationPanel() {
             <span className="mig-name" title={e.name}>
               {e.name || '—'}
               {showType && (
-                <span className={`tag ${e.type === 'join' ? 'tag-new' : 'tag-left'}`}>
-                  {e.type === 'join' ? t('tag_new') : t('tag_left')}
-                </span>
+                e.kind === 'unconfirmed'
+                  ? <span className="tag">{t('mig_tag_unconfirmed')}</span>
+                  : <span className={`tag ${e.kind === 'join' ? 'tag-new' : 'tag-left'}`}>
+                      {e.kind === 'join' ? t('tag_new') : t('tag_left')}
+                    </span>
               )}
               {e.suspect && <span className="tag" title={t('mig_check')}>{t('mig_check')}</span>}
+              {isOwner && e.kind === 'unconfirmed' && (
+                <>
+                  <button type="button" className="dkp-btn-danger" style={{ padding: '3px 10px', fontSize: '0.68rem' }}
+                    onClick={() => setVerdict(e.id, 'left')}>{t('mig_confirm_left')}</button>
+                  <button type="button" className="dkp-btn-secondary" style={{ padding: '3px 10px', fontSize: '0.68rem' }}
+                    onClick={() => setVerdict(e.id, 'stayed')}>{t('mig_still_here')}</button>
+                </>
+              )}
             </span>
             <span className="mig-num">{e.id}</span>
             <span className="mig-num">{formatCount(e.power)}</span>
@@ -10718,8 +10814,10 @@ function MigrationPanel() {
   if (dates.length === 0) return <p className="muted-line">{t('mig_no_data')}</p>;
   if (dates.length < 2) return <p className="muted-line">{t('mig_need_two')}</p>;
 
-  const isList = view === 'joined' || view === 'left';
-  const currentList = isList ? listFor(view === 'joined' ? 'join' : 'left') : [];
+  const isList = view === 'joined' || view === 'left' || view === 'unconfirmed';
+  const currentList = isList
+    ? listFor(view === 'joined' ? 'join' : view === 'left' ? 'left' : 'unconfirmed')
+    : [];
   const maxBar = Math.max(1, ...rangeTransitions.map(tr => Math.max(tr.joined, tr.left)));
 
   return (
@@ -10729,6 +10827,7 @@ function MigrationPanel() {
           ['dashboard', 'mig_tab_dashboard'],
           ['joined',    'mig_tab_joined'],
           ['left',      'mig_tab_left'],
+          ['unconfirmed', 'mig_tab_unconfirmed'],
           ['history',   'mig_tab_history'],
         ].map(([id, key]) => (
           <button
@@ -10798,9 +10897,14 @@ function MigrationPanel() {
               <span className="dkp-summary-value">{formatCount(stats.total)}</span>
               <span className="dkp-summary-sub">{formatCount(stats.unique)} {t('mig_unique')}</span>
             </div>
+            <div className="dkp-summary-card">
+              <span className="dkp-summary-label">{t('mig_unconfirmed')}</span>
+              <span className="dkp-summary-value" style={{ color: 'var(--accent-strong)' }}>{formatCount(stats.unconfirmed)}</span>
+              <span className="dkp-summary-sub">{t('mig_unconfirmed_note')}</span>
+            </div>
           </div>
 
-          <p className="muted-line" style={{ fontSize: '0.78rem' }}>{t('mig_note')}</p>
+          <p className="muted-line" style={{ fontSize: '0.78rem' }}>{t('mig_note_v2')}</p>
           {stats.suspect > 0 && (
             <p className="muted-line" style={{ color: 'var(--accent-strong)', fontSize: '0.8rem' }}>
               {t('mig_suspect_note').replace('{n}', formatCount(stats.suspect))}
