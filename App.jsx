@@ -5538,7 +5538,11 @@ async function parseGovernorFile(file) {
     };
   }
   if (Object.keys(governors).length === 0) throw new Error('No governor rows found in this file');
-  return { governors, missingCritical, missingOptional, hasDeathData };
+  const helpsInfo = {
+    column: col.helps !== -1 ? String(header[col.helps]) : null,
+    total: Object.values(governors).reduce((s, g) => s + (g.helps || 0), 0),
+  };
+  return { governors, missingCritical, missingOptional, hasDeathData, helpsInfo };
 }
 
 /* ---------- owner-only scan control ---------- */
@@ -5841,7 +5845,10 @@ const file = e.target.files && e.target.files[0];
     setUploading(true);
     setUploadMsg(null);
     try {
-      const { governors, missingCritical, missingOptional, hasDeathData } = await parseGovernorFile(file);
+      const { governors, missingCritical, missingOptional, hasDeathData, helpsInfo } = await parseGovernorFile(file);
+      const helpsNote = helpsInfo.column
+        ? ` Helps: ${formatCount(helpsInfo.total)} (column "${helpsInfo.column}")${helpsInfo.total === 0 ? ' ⚠ all zero, check the file' : ''}.`
+        : ' ⚠ No Helps column found in this file.';
       const fresh = await loadDkpStateRemote();
       if (!fresh) throw new Error('Could not reach the database. Nothing was changed, try again.');
       const nextMeta = { ...(fresh.meta || {}), [uploadDate]: { hasDeathData, isKvkStats: uploadType === 'kvk' } };
@@ -5863,7 +5870,7 @@ const file = e.target.files && e.target.files[0];
         .replace('{count}', formatCount(Object.keys(governors).length))
         .replace('{date}', uploadDate);
       setUploadMsg(saved
-        ? { type: missingCritical.length ? 'error' : 'success', text: `${loadedText}${criticalNote}${missingNote}` }
+        ? { type: missingCritical.length ? 'error' : 'success', text: `${loadedText}${criticalNote}${missingNote}${helpsNote}` }
         : { type: 'error', text: t('msg_save_failed') });
     } catch (err) {
       setUploadMsg({ type: 'error', text: err.message || t('msg_could_not_read') });
