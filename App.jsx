@@ -471,6 +471,38 @@ const LANGUAGES = [
 const TRANSLATIONS = {
   en: {
     nav_activity:"Activity",
+    nav_migration:"Migration",
+    mig_title:"Kingdom Migration",
+    mig_tab_dashboard:"Dashboard",
+    mig_tab_joined:"Joined",
+    mig_tab_left:"Left",
+    mig_tab_history:"History",
+    mig_joined:"Players Joined",
+    mig_left:"Players Left",
+    mig_net:"Net Migration",
+    mig_total:"Total Migration Activity",
+    mig_unique:"unique players",
+    mig_loading:"Loading migration data…",
+    mig_load_failed:"Could not load snapshots. Check your connection and try again.",
+    mig_no_data:"No snapshots yet. Upload governor files in the DKP tab first.",
+    mig_need_two:"At least two snapshots are needed to detect migration.",
+    mig_no_events:"No migration detected in this range.",
+    mig_note:"Detected by comparing the governor snapshots uploaded in the DKP tab. An ID missing from one snapshot and present in the next counts as Joined; present then missing counts as Left. Only the snapshot dates the change happened between are known, and the files contain no previous / destination kingdom.",
+    mig_suspect_note:"{n} event(s) come from snapshots where over 20% of governors changed at once. This usually means a partial file was uploaded, not real migration. Verify these before relying on them.",
+    mig_check:"Check file",
+    mig_col_player:"Player",
+    mig_col_id:"ID",
+    mig_col_power:"Power",
+    mig_col_detected:"Detected between",
+    mig_col_moves:"Moves",
+    mig_recent:"Recent migration",
+    mig_chart_title:"Joined vs Left per snapshot",
+    mig_sort_new:"Newest first",
+    mig_sort_old:"Oldest first",
+    mig_sort_name_az:"Name A–Z",
+    mig_sort_name_za:"Name Z–A",
+    mig_sort_power_hl:"Power high–low",
+    mig_sort_power_lh:"Power low–high",
     activity_title:"Kingdom Activity",
     activity_tab_farms:"Farms & Alliance Help",
     activity_tab_fort:"Barbarian Fort",
@@ -10525,7 +10557,300 @@ function FeedbackPanel() {
   );
 }
 
+const MigrationIcon = p => (
+  <svg viewBox="0 0 24 24" fill="none" {...p}>
+    <path d="M4 8h13M13 4l4 4-4 4M20 16H7M11 12l-4 4 4 4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+);
+
+function MigrationPanel() {
+  const { t } = useT();
+  const [snapshots, setSnapshots] = useState({});
+  const [loaded, setLoaded]       = useState(false);
+  const [failed, setFailed]       = useState(false);
+  const [view, setView]           = useState('dashboard');
+  const [fromDate, setFromDate]   = useState('');
+  const [toDate, setToDate]       = useState('');
+  const [search, setSearch]       = useState('');
+  const [sortBy, setSortBy]       = useState('date-desc');
+  const [visibleCount, setVisibleCount] = useState(50);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const remote = await loadDkpStateRemote();
+      if (cancelled) return;
+      if (remote) { setSnapshots(remote.snapshots || {}); setFailed(false); }
+      else setFailed(true);
+      setLoaded(true);
+    };
+    load();
+    const id = setInterval(load, DKP_POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  const dates = useMemo(() => Object.keys(snapshots).sort(), [snapshots]);
+
+  useEffect(() => {
+    if (dates.length === 0) return;
+    if (!fromDate || !dates.includes(fromDate)) setFromDate(dates[0]);
+    if (!toDate   || !dates.includes(toDate))   setToDate(dates[dates.length - 1]);
+  }, [dates]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => { setVisibleCount(50); }, [view, fromDate, toDate, search, sortBy]);
+
+  // Compare every pair of consecutive snapshots
+  const transitions = useMemo(() => {
+    const out = [];
+    for (let i = 1; i < dates.length; i++) {
+      const prev = snapshots[dates[i - 1]] || {};
+      const cur  = snapshots[dates[i]] || {};
+      const events = [];
+      Object.keys(cur).forEach(id => {
+        if (!prev[id]) events.push({ type: 'join', id, name: cur[id].username, power: cur[id].power || 0, date: dates[i], since: dates[i - 1] });
+      });
+      Object.keys(prev).forEach(id => {
+        if (!cur[id]) events.push({ type: 'left', id, name: prev[id].username, power: prev[id].power || 0, date: dates[i], since: dates[i - 1] });
+      });
+      const base = Math.max(Object.keys(prev).length, Object.keys(cur).length, 1);
+      const suspect = events.length / base > 0.2;
+      events.forEach(e => { e.suspect = suspect; e.key = e.id + '|' + e.type + '|' + e.date; });
+      out.push({
+        date: dates[i], since: dates[i - 1], events, suspect,
+        joined: events.filter(e => e.type === 'join').length,
+        left:   events.filter(e => e.type === 'left').length,
+      });
+    }
+    return out;
+  }, [snapshots, dates]);
+
+  const lowD  = fromDate && toDate ? (fromDate < toDate ? fromDate : toDate) : '';
+  const highD = fromDate && toDate ? (fromDate < toDate ? toDate : fromDate) : '';
+
+  const rangeTransitions = useMemo(
+    () => transitions.filter(tr => tr.date > lowD && tr.date <= highD),
+    [transitions, lowD, highD]
+  );
+  const events = useMemo(() => rangeTransitions.flatMap(tr => tr.events), [rangeTransitions]);
+
+  const stats = useMemo(() => {
+    const joined = events.filter(e => e.type === 'join').length;
+    const left   = events.filter(e => e.type === 'left').length;
+    return {
+      joined, left,
+      net: joined - left,
+      total: joined + left,
+      unique: new Set(events.map(e => e.id)).size,
+      suspect: events.filter(e => e.suspect).length,
+    };
+  }, [events]);
+
+  const movesById = useMemo(() => {
+    const m = {};
+    events.forEach(e => { m[e.id] = (m[e.id] || 0) + 1; });
+    return m;
+  }, [events]);
+
+  const sortFn = {
+    'date-desc':  (a, b) => b.date.localeCompare(a.date) || String(a.name || '').localeCompare(String(b.name || '')),
+    'date-asc':   (a, b) => a.date.localeCompare(b.date) || String(a.name || '').localeCompare(String(b.name || '')),
+    'name-asc':   (a, b) => String(a.name || '').localeCompare(String(b.name || '')),
+    'name-desc':  (a, b) => String(b.name || '').localeCompare(String(a.name || '')),
+    'power-desc': (a, b) => b.power - a.power,
+    'power-asc':  (a, b) => a.power - b.power,
+  }[sortBy];
+
+  const listFor = (type) => {
+    const q = search.trim().toLowerCase();
+    return events
+      .filter(e => e.type === type && (!q || String(e.name || '').toLowerCase().includes(q) || String(e.id).includes(q)))
+      .sort(sortFn);
+  };
+
+  const recent = useMemo(
+    () => [...events].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 10),
+    [events]
+  );
+
+  const renderTable = (list, showType) => (
+    <div className="dkp-table-scroll">
+      <div className="mig-table">
+        <div className="mig-head">
+          <span>#</span>
+          <span>{t('mig_col_player')}</span>
+          <span>{t('mig_col_id')}</span>
+          <span>{t('mig_col_power')}</span>
+          <span>{t('mig_col_detected')}</span>
+          <span>{t('mig_col_moves')}</span>
+        </div>
+        {list.map((e, i) => (
+          <div className="mig-row" key={e.key}>
+            <span className="dkp-rank">{i + 1}</span>
+            <span className="mig-name" title={e.name}>
+              {e.name || '—'}
+              {showType && (
+                <span className={`tag ${e.type === 'join' ? 'tag-new' : 'tag-left'}`}>
+                  {e.type === 'join' ? t('tag_new') : t('tag_left')}
+                </span>
+              )}
+              {e.suspect && <span className="tag" title={t('mig_check')}>{t('mig_check')}</span>}
+            </span>
+            <span className="mig-num">{e.id}</span>
+            <span className="mig-num">{formatCount(e.power)}</span>
+            <span className="mig-num">{e.since} → {e.date}</span>
+            <span className="mig-num">{movesById[e.id] || 1}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderLoadMore = (len) => visibleCount < len && (
+    <div style={{ display: 'flex', justifyContent: 'center' }}>
+      <button type="button" className="btn-primary" onClick={() => setVisibleCount(v => v + 50)}>
+        {t('load_more')} ({formatCount(len - visibleCount)} {t('remaining_suffix')})
+      </button>
+    </div>
+  );
+
+  if (!loaded) return <p className="muted-line">{t('mig_loading')}</p>;
+  if (failed && dates.length === 0) return <p className="muted-line" style={{ color: 'var(--danger)' }}>{t('mig_load_failed')}</p>;
+  if (dates.length === 0) return <p className="muted-line">{t('mig_no_data')}</p>;
+  if (dates.length < 2) return <p className="muted-line">{t('mig_need_two')}</p>;
+
+  const isList = view === 'joined' || view === 'left';
+  const currentList = isList ? listFor(view === 'joined' ? 'join' : 'left') : [];
+  const maxBar = Math.max(1, ...rangeTransitions.map(tr => Math.max(tr.joined, tr.left)));
+
+  return (
+    <div className="mig-wrap">
+      <div className="act-tabs mig-tabs" role="tablist">
+        {[
+          ['dashboard', 'mig_tab_dashboard'],
+          ['joined',    'mig_tab_joined'],
+          ['left',      'mig_tab_left'],
+          ['history',   'mig_tab_history'],
+        ].map(([id, key]) => (
+          <button
+            key={id} type="button" role="tab" aria-selected={view === id}
+            className={`act-tab${view === id ? ' active' : ''}`}
+            onClick={() => setView(id)}
+          >
+            {t(key)}
+          </button>
+        ))}
+      </div>
+
+      <div className="dkp-scan-card">
+        <div className="dkp-scan-actions" style={{ flexWrap: 'wrap' }}>
+          <label className="muted-line" style={{ margin: 0 }}>
+            {t('from_label')}{' '}
+            <select className="dkp-name-input" style={{ display: 'inline-block', width: 'auto' }} value={fromDate} onChange={e => setFromDate(e.target.value)}>
+              {dates.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </label>
+          <label className="muted-line" style={{ margin: 0 }}>
+            {t('to_label')}{' '}
+            <select className="dkp-name-input" style={{ display: 'inline-block', width: 'auto' }} value={toDate} onChange={e => setToDate(e.target.value)}>
+              {dates.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </label>
+          {isList && (
+            <>
+              <label className="muted-line" style={{ margin: 0 }}>
+                {t('sort_label')}{' '}
+                <select className="dkp-name-input" style={{ display: 'inline-block', width: 'auto' }} value={sortBy} onChange={e => setSortBy(e.target.value)}>
+                  <option value="date-desc">{t('mig_sort_new')}</option>
+                  <option value="date-asc">{t('mig_sort_old')}</option>
+                  <option value="name-asc">{t('mig_sort_name_az')}</option>
+                  <option value="name-desc">{t('mig_sort_name_za')}</option>
+                  <option value="power-desc">{t('mig_sort_power_hl')}</option>
+                  <option value="power-asc">{t('mig_sort_power_lh')}</option>
+                </select>
+              </label>
+              <input
+                type="text" className="dkp-name-input"
+                placeholder={t('search_placeholder')}
+                value={search} onChange={e => setSearch(e.target.value)}
+              />
+            </>
+          )}
+        </div>
+      </div>
+
+      {view === 'dashboard' && (
+        <>
+          <div className="dkp-summary-grid">
+            <div className="dkp-summary-card">
+              <span className="dkp-summary-label">{t('mig_joined')}</span>
+              <span className="dkp-summary-value" style={{ color: 'var(--live)' }}>+{formatCount(stats.joined)}</span>
+            </div>
+            <div className="dkp-summary-card">
+              <span className="dkp-summary-label">{t('mig_left')}</span>
+              <span className="dkp-summary-value" style={{ color: 'var(--danger)' }}>−{formatCount(stats.left)}</span>
+            </div>
+            <div className="dkp-summary-card dkp-summary-top">
+              <span className="dkp-summary-label">{t('mig_net')}</span>
+              <span className="dkp-summary-value accent">{stats.net > 0 ? '+' : stats.net < 0 ? '−' : ''}{formatCount(Math.abs(stats.net))}</span>
+            </div>
+            <div className="dkp-summary-card">
+              <span className="dkp-summary-label">{t('mig_total')}</span>
+              <span className="dkp-summary-value">{formatCount(stats.total)}</span>
+              <span className="dkp-summary-sub">{formatCount(stats.unique)} {t('mig_unique')}</span>
+            </div>
+          </div>
+
+          <p className="muted-line" style={{ fontSize: '0.78rem' }}>{t('mig_note')}</p>
+          {stats.suspect > 0 && (
+            <p className="muted-line" style={{ color: 'var(--accent-strong)', fontSize: '0.8rem' }}>
+              {t('mig_suspect_note').replace('{n}', formatCount(stats.suspect))}
+            </p>
+          )}
+
+          <div className="section-label">{t('mig_recent')}</div>
+          {recent.length === 0 ? <p className="muted-line">{t('mig_no_events')}</p> : renderTable(recent, true)}
+        </>
+      )}
+
+      {isList && (
+        currentList.length === 0
+          ? <p className="muted-line">{t('mig_no_events')}</p>
+          : <>
+              {renderTable(currentList.slice(0, visibleCount), false)}
+              {renderLoadMore(currentList.length)}
+            </>
+      )}
+
+      {view === 'history' && (
+        rangeTransitions.length === 0
+          ? <p className="muted-line">{t('mig_no_events')}</p>
+          : <>
+              <div className="section-label">{t('mig_chart_title')}</div>
+              <div className="mig-legend">
+                <span><i className="mig-dot in" /> {t('mig_tab_joined')}</span>
+                <span><i className="mig-dot out" /> {t('mig_tab_left')}</span>
+              </div>
+              <div className="mig-chart">
+                {rangeTransitions.map(tr => (
+                  <div className="mig-chart-col" key={tr.date} title={`${tr.since} → ${tr.date}`}>
+                    <div className="mig-bars">
+                      <span className="mig-bar in"  style={{ height: (tr.joined / maxBar) * 100 + '%' }} />
+                      <span className="mig-bar out" style={{ height: (tr.left   / maxBar) * 100 + '%' }} />
+                    </div>
+                    <span className="mig-chart-nums">+{tr.joined} / −{tr.left}</span>
+                    <span className="mig-chart-label">{tr.date}</span>
+                    {tr.suspect && <span className="tag">{t('mig_check')}</span>}
+                  </div>
+                ))}
+              </div>
+            </>
+      )}
+    </div>
+  );
+}
+
 const ChatPanelM       = React.memo(ChatPanel);
+const MigrationPanelM  = React.memo(MigrationPanel);
 const DkpPanelM        = React.memo(DkpPanel);
 const ActivityPanelM   = React.memo(ActivityPanel);
 const CalendarPanelM   = React.memo(CalendarPanel);
@@ -10538,6 +10863,7 @@ const NAV_ITEMS = [
   { id: 'chat',        labelKey: 'nav_chat',       icon: Icon.chat     },
 { id: 'activity',   labelKey: 'nav_activity',   icon: ActivityIcon  },
   { id: 'dkp',labelKey: 'nav_dkp',        icon: Icon.target   },
+  { id: 'migration',   labelKey: 'nav_migration',  icon: MigrationIcon },
   { id: 'schedule',    labelKey: 'nav_calendar',   icon: Icon.calendar },
   { id: 'calculator',  labelKey: 'nav_calculator', icon: Icon.calc     },
   { id: 'members',     labelKey: 'nav_visitors',   icon: Icon.users    },
@@ -11192,6 +11518,12 @@ if (!document.querySelector('meta[name="google"][content="notranslate"]')) {
           <section className={`panel${activeTab === 'activity' ? ' active' : ''}`}>
             <div className="section-label">{t('activity_title')}</div>
             {activeTab === 'activity' && <ActivityPanelM />}
+          </section>
+
+          {/* ----- Migration ----- */}
+          <section className={`panel${activeTab === 'migration' ? ' active' : ''}`}>
+            <div className="section-label">{t('mig_title')}</div>
+            {activeTab === 'migration' && <MigrationPanelM />}
           </section>
 
           {/* ----- DKP Tracker ----- */}
