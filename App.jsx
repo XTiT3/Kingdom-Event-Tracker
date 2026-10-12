@@ -5056,17 +5056,142 @@ async function translateChatText(text, targetLang) {
   }
 }
 
-async function loadDkpStateRemote() {
+/* =====================================================================
+   DKP DATA LAYER — bandwidth-friendly.
+   Each date is stored at  dkp_snapshots/snapshots/<date>  and is
+   downloaded ONCE, then kept in memory + IndexedDB. Polling only reads
+   the tiny "meta" + a shallow key list (a few hundred bytes), so the
+   Firebase free-plan download limit is no longer hit.
+   ===================================================================== */
+const DKP_BASE = DKP_KV_URL.replace(/\.json$/, '');
+const dkpMem = new Map();      // date -> { v: versionToken, data: {id: governor} }
+let dkpLastState = null;
+let dkpLastSig = '';
+let dkpInflight = null;
+let dkpDbPromise = null;
+
+function dkpDb() {
+  if (dkpDbPromise) return dkpDbPromise;
+  dkpDbPromise = new Promise((resolve) => {
+    try {
+      const req = indexedDB.open('xtit_dkp_cache_v1', 1);
+      req.onupgradeneeded = () => { try { req.result.createObjectStore('snaps'); } catch (e) {} };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+  return dkpDbPromise;
+}
+async function dkpCacheGet(date) {
+  const db = await dkpDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const rq = db.transaction('snaps', 'readonly').objectStore('snaps').get(date);
+      rq.onsuccess = () => resolve(rq.result || null);
+      rq.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+}
+async function dkpCachePut(date, entry) {
+  const db = await dkpDb();
+  if (!db) return;
+  try { db.transaction('snaps', 'readwrite').objectStore('snaps').put(entry, date); } catch (e) {}
+}
+async function dkpCacheDel(date) {
+  const db = await dkpDb();
+  if (!db) return;
+  try { db.transaction('snaps', 'readwrite').objectStore('snaps').delete(date); } catch (e) {}
+}
+async function dkpFetchJson(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error('DKP fetch failed: ' + res.status);
+  return res.json();
+}
+
+async function loadDkpStateRemoteInner() {
   try {
-    const res = await fetch(DKP_KV_URL, { cache: 'no-store' });
-    if (res.status === 404) return { snapshots: {}, meta: {} };
-    if (!res.ok) throw new Error('DKP fetch failed: ' + res.status);
-    const parsed = await res.json();
-    if (!parsed || typeof parsed.snapshots !== 'object') return { snapshots: {}, meta: {} };
-    if (typeof parsed.meta !== 'object' || !parsed.meta) parsed.meta = {};
-    return parsed;
+    const [metaRaw, keysRaw] = await Promise.all([
+      dkpFetchJson(DKP_BASE + '/meta.json'),
+      dkpFetchJson(DKP_BASE + '/snapshots.json?shallow=true'),
+    ]);
+    const meta = metaRaw && typeof metaRaw === 'object' ? metaRaw : {};
+    const dates = keysRaw && typeof keysRaw === 'object' ? Object.keys(keysRaw).sort() : [];
+    const tokenOf = d => String((meta[d] && meta[d].uploadedAt) || 'legacy');
+    const sig = dates.map(d => d + ':' + tokenOf(d)).join('|') + '#' + JSON.stringify(meta);
+    // nothing changed since the last poll -> same object, React skips re-render
+    if (dkpLastState && sig === dkpLastSig) return dkpLastState;
+
+    const snapshots = {};
+    await Promise.all(dates.map(async (d) => {
+      const tok = tokenOf(d);
+      let hit = dkpMem.get(d);
+      if (!hit || hit.v !== tok) {
+        const cached = await dkpCacheGet(d);
+        if (cached && cached.v === tok && cached.data) {
+          hit = cached;
+        } else {
+          const data = await dkpFetchJson(DKP_BASE + '/snapshots/' + encodeURIComponent(d) + '.json');
+          hit = { v: tok, data: data || {} };
+          dkpCachePut(d, hit);
+        }
+        dkpMem.set(d, hit);
+      }
+      snapshots[d] = hit.data;
+    }));
+    const state = { snapshots, meta };
+    dkpLastState = state;
+    dkpLastSig = sig;
+    return state;
   } catch (e) {
     return null;
+  }
+}
+// all panels share one in-flight request
+async function loadDkpStateRemote() {
+  if (!dkpInflight) {
+    dkpInflight = loadDkpStateRemoteInner().finally(() => { dkpInflight = null; });
+  }
+  return dkpInflight;
+}
+
+// Saves ONE date (snapshot + meta) instead of re-uploading everything.
+async function saveDkpSnapshotRemote(date, governors, metaEntry) {
+  try {
+    const key = encodeURIComponent(date);
+    const uploadedAt = Date.now();
+    const r1 = await fetch(`${DKP_BASE}/snapshots/${key}.json`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(governors),
+    });
+    if (!r1.ok) { console.error('DKP snapshot save failed:', r1.status, await r1.text().catch(() => '')); return false; }
+    const r2 = await fetch(`${DKP_BASE}/meta/${key}.json`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...metaEntry, uploadedAt }),
+    });
+    if (!r2.ok) { console.error('DKP meta save failed:', r2.status, await r2.text().catch(() => '')); return false; }
+    const hit = { v: String(uploadedAt), data: governors };
+    dkpMem.set(date, hit);
+    dkpCachePut(date, hit);
+    dkpLastSig = '';
+    return true;
+  } catch (e) {
+    console.error('DKP save error:', e);
+    return false;
+  }
+}
+async function deleteDkpSnapshotRemote(date) {
+  try {
+    const key = encodeURIComponent(date);
+    const a = await fetch(`${DKP_BASE}/snapshots/${key}.json`, { method: 'DELETE' });
+    const b = await fetch(`${DKP_BASE}/meta/${key}.json`, { method: 'DELETE' });
+    dkpMem.delete(date);
+    dkpCacheDel(date);
+    dkpLastSig = '';
+    return a.ok && b.ok;
+  } catch (e) {
+    return false;
   }
 }
 async function saveDkpStateRemote(state) {
@@ -5859,7 +5984,20 @@ const file = e.target.files && e.target.files[0];
       const idx = sortedDates.indexOf(uploadDate);
       setToDate(uploadDate);
       setFromDate(idx > 0 ? sortedDates[idx - 1] : uploadDate);
-      const saved = await saveDkpStateRemote(nextState);
+      const saved = await saveDkpSnapshotRemote(uploadDate, governors, nextMeta[uploadDate]);
+      let verifyNote = '';
+      if (saved) {
+        try {
+          // read straight from the database (bypasses every cache)
+          const stored = await dkpFetchJson(DKP_BASE + '/snapshots/' + encodeURIComponent(uploadDate) + '.json');
+          const storedTotal = stored
+            ? Object.values(stored).reduce((sum, g) => sum + (Number(g && g.helps) || 0), 0)
+            : null;
+          verifyNote = storedTotal === helpsInfo.total
+            ? ' \u2713 Verified in database.'
+            : ` \u26A0 Database holds ${storedTotal === null ? 'nothing' : formatCount(storedTotal)} helps, expected ${formatCount(helpsInfo.total)}.`;
+        } catch (e) { verifyNote = ' \u26A0 Could not verify.'; }
+      }
       const missingNote = missingOptional.length
         ? t('msg_missing_optional').replace('{cols}', missingOptional.join(', '))
         : '';
@@ -5870,7 +6008,7 @@ const file = e.target.files && e.target.files[0];
         .replace('{count}', formatCount(Object.keys(governors).length))
         .replace('{date}', uploadDate);
       setUploadMsg(saved
-        ? { type: missingCritical.length ? 'error' : 'success', text: `${loadedText}${criticalNote}${missingNote}${helpsNote}` }
+        ? { type: missingCritical.length ? 'error' : 'success', text: `${loadedText}${criticalNote}${missingNote}${helpsNote}${verifyNote}` }
         : { type: 'error', text: t('msg_save_failed') });
     } catch (err) {
       setUploadMsg({ type: 'error', text: err.message || t('msg_could_not_read') });
@@ -5891,7 +6029,7 @@ const file = e.target.files && e.target.files[0];
         delete nextMeta[date];
         const nextState = { snapshots: nextSnapshots, meta: nextMeta };
         setState(nextState);
-        await saveDkpStateRemote(nextState);
+        await deleteDkpSnapshotRemote(date);
         setConfirmPrompt(null);
       },
       onCancel: () => setConfirmPrompt(null)
@@ -8612,6 +8750,11 @@ function ActivityPanel() {
                   <span className="dkp-summary-value">{formatCount(totals.resources)}</span>
                 </div>
               </div>
+              {totals.players > 0 && totals.helps === 0 && (
+                <div style={{ margin: '12px 0', padding: '10px 14px', borderRadius: 10, border: '1px solid #e0a030', color: '#e0a030', fontSize: 13 }}>
+                  {'\u26A0'} The stored snapshots for {fromDate} {'\u2192'} {toDate} contain no helps data. Re-upload those governor files in DKP (same dates) to fix this.
+                </div>
+              )}
 
               <div className="dkp-table-nav">
                 <div style={{ display: 'flex', gap: '10px' }}>
