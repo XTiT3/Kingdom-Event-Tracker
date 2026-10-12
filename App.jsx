@@ -478,7 +478,7 @@ const TRANSLATIONS = {
     mig_tab_left:"Left",
     mig_tab_history:"History",
     mig_joined:"Joined Kingdom",
-    mig_left:"Left Kingdom (Confirmed)",
+    mig_left:"Left Kingdom",
     mig_unconfirmed:"Unconfirmed Departures",
     mig_tab_unconfirmed:"Unconfirmed",
     mig_tag_unconfirmed:"Unconfirmed",
@@ -10716,7 +10716,49 @@ function MigrationPanel() {
     () => transitions.filter(tr => tr.date > lowD && tr.date <= highD),
     [transitions, lowD, highD]
   );
-  const events = useMemo(() => rangeTransitions.flatMap(tr => tr.events), [rangeTransitions]);
+  const events = useMemo(() => {
+    if (!lowD || !highD || lowD === highD) return [];
+    const earlier = snapshots[lowD] || {};
+    const later   = snapshots[highD] || {};
+    const out = [];
+
+    // Joined: ID is in the later list but not in the earlier list
+    Object.keys(later).forEach(id => {
+      if (earlier[id]) return;
+      out.push({
+        type: 'join', kind: 'join', confirmed: true,
+        id, name: later[id].username, power: later[id].power || 0,
+        date: highD, since: lowD, suspect: false,
+        key: id + '|join|' + highD,
+      });
+    });
+
+    // Left: ID is in the earlier list but missing from the later list
+    Object.keys(earlier).forEach(id => {
+      if (later[id]) return;
+      const verdict = verdicts[id];
+      if (verdict === 'stayed') return;               // owner says still in kingdom
+      // Confirmed only if a snapshot after the range lists them under another kingdom, or the owner confirmed
+      let confirmed = verdict === 'left';
+      if (!confirmed) {
+        for (let j = dates.indexOf(highD) + 1; j < dates.length; j++) {
+          const en = (snapshots[dates[j]] || {})[id];
+          if (en && isForeignKingdom(en)) { confirmed = true; break; }
+        }
+      }
+      out.push({
+        type: 'left', kind: 'left', confirmed,
+        id, name: earlier[id].username, power: earlier[id].power || 0,
+        date: highD, since: lowD, suspect: false,
+        key: id + '|left|' + lowD + '|' + highD,
+      });
+    });
+
+    // Safety flag: if more than 20% of the list changed, the file is probably partial
+    const base = Math.max(Object.keys(earlier).length, Object.keys(later).length, 1);
+    if (out.length / base > 0.2) out.forEach(e => { e.suspect = true; });
+    return out;
+  }, [snapshots, dates, lowD, highD, verdicts]);
 
   const stats = useMemo(() => {
     const joined = events.filter(e => e.kind === 'join').length;
@@ -10782,7 +10824,10 @@ function MigrationPanel() {
                     </span>
               )}
               {e.suspect && <span className="tag" title={t('mig_check')}>{t('mig_check')}</span>}
-              {isOwner && e.kind === 'unconfirmed' && (
+              {e.kind === 'left' && !e.confirmed && (
+                <span className="tag" title="Missing from later list. Not confirmed as a kingdom departure.">Missing from later list</span>
+              )}
+              {isOwner && e.kind === 'left' && !e.confirmed && (
                 <>
                   <button type="button" className="dkp-btn-danger" style={{ padding: '3px 10px', fontSize: '0.68rem' }}
                     onClick={() => setVerdict(e.id, 'left')}>{t('mig_confirm_left')}</button>
