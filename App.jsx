@@ -5334,7 +5334,7 @@ const COLUMN_ALIASES = {
   highest:   ['highest power'],
   kp:        ['total kill points', 'kill points', 'kp'],
   resources: ['resources gathered', 'resources'],
-  helps:     ['alliance helps', 'alliance help', 'helps'],
+  helps:     ['alliance helps', 'alliance help', 'alliance helps given', 'alliance help given', 'total alliance helps', 'total alliance help', 'total helps', 'total help', 'helps given', 'help given', 'helps', 'help'],
   t5k:       ['t5 kills', 'tier 5 kills'],
   t4k:       ['t4 kills', 'tier 4 kills'],
   t3k:       ['t3 kills', 'tier 3 kills'],
@@ -5350,6 +5350,7 @@ const COLUMN_ALIASES = {
 
 function normalizeHeader(h) {
   return String(h || '')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '') // strip zero-width / BOM
     .trim()
     .toLowerCase()
     .replace(/[_\-]+/g, ' ')
@@ -8119,7 +8120,7 @@ const ACTIVITY_POLL_MS = 30000;
 const ACTIVITY_COLUMN_ALIASES = {
   id:        ['character id', 'governor id', 'id'],
   username:  ['username', 'name', 'governor name'],
-  helps:     ['alliance helps', 'alliance help', 'helps'],
+  helps:     ['alliance helps', 'alliance help', 'alliance helps given', 'alliance help given', 'total alliance helps', 'total alliance help', 'total helps', 'total help', 'helps given', 'help given', 'helps', 'help'],
   resources: ['resources gathered', 'resources'],
 };
 
