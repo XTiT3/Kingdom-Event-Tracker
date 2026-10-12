@@ -5393,6 +5393,43 @@ function findColumnIndex(headerRow, aliases) {
   return -1;
 }
 
+// Finds the Alliance Helps column when the normal alias list misses it.
+//  1) any unmapped header containing a "help/assist" keyword (spaces ignored)
+//  2) otherwise the LAST unmapped column that holds real numeric data
+function detectHelpsColumn(header, rows, col) {
+  const used = new Set(
+    Object.values(col).filter(v => typeof v === 'number' && v !== -1)
+  );
+  const KEYWORD_RE = /help|assist|yard[iı]m|ayuda|ajuda|помощ|同盟|동맹|hỗ?trợ|مساعدة|bantuan|hilfe|aiuto|aide|unterst/i;
+  const NOT_HELPS_RE = /^(id|character ?id|governor ?id|username|name|governor ?name|kingdom|home ?kingdom|kingdom ?id|alliance|alliance ?tag|rank|city ?hall|ch)$|power|kill|death|dead|resource|gather|\bkp\b|\bt[1-5]\b/;
+
+  // 1) keyword match on the header text
+  for (let i = 0; i < header.length; i++) {
+    if (used.has(i)) continue;
+    const h = normalizeHeader(header[i]);
+    if (!h) continue;
+    if (KEYWORD_RE.test(h) || KEYWORD_RE.test(h.replace(/\s/g, ''))) return i;
+  }
+
+  // 2) data-driven: last unmapped numeric column (RoK exports put Helps last)
+  const sample = rows.slice(1, 201).filter(r => r && r.length);
+  for (let i = header.length - 1; i >= 0; i--) {
+    if (used.has(i)) continue;
+    const h = normalizeHeader(header[i]);
+    if (!h || NOT_HELPS_RE.test(h)) continue;
+    let numeric = 0, nonZero = 0;
+    sample.forEach(r => {
+      const raw = String(r[i] ?? '').replace(/[,\s]/g, '');
+      if (raw !== '' && /^-?\d+(\.\d+)?$/.test(raw)) {
+        numeric++;
+        if (Number(raw) > 0) nonZero++;
+      }
+    });
+    if (sample.length > 0 && numeric / sample.length > 0.8 && nonZero > 0) return i;
+  }
+  return -1;
+}
+
 async function parseGovernorFile(file) {
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: 'array' });
@@ -5447,6 +5484,16 @@ async function parseGovernorFile(file) {
     // eslint-disable-next-line no-console
     console.log('[Governor parser] resolved columns:', col);
   } catch (e) {}
+
+  // Helps still not found? Use the smarter detector (keyword + numeric-data scan).
+  if (col.helps === -1) {
+    col.helps = detectHelpsColumn(header, rows, col);
+    try {
+      // eslint-disable-next-line no-console
+      console.log('[Governor parser] helps detected via fallback at index', col.helps,
+        col.helps !== -1 ? '-> "' + header[col.helps] + '"' : '(NOT FOUND)');
+    } catch (e) {}
+  }
 
   if (col.id === -1 || col.username === -1) {
     throw new Error('Could not find Character ID / Username columns in this file');
