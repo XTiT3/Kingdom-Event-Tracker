@@ -5057,31 +5057,13 @@ async function translateChatText(text, targetLang) {
 }
 
 /* =====================================================================
-   DKP DATA LAYER — Supabase (free, no card). One row per date in the
-   table "dkp_snapshots". Each date is downloaded ONCE, then kept in
-   memory + IndexedDB. Polling only reads the tiny date/meta list.
-   >>> Fill in the two values below (see setup steps). <<<
+   DKP DATA LAYER — bandwidth-friendly.
+   Each date is stored at  dkp_snapshots/snapshots/<date>  and is
+   downloaded ONCE, then kept in memory + IndexedDB. Polling only reads
+   the tiny "meta" + a shallow key list (a few hundred bytes), so the
+   Firebase free-plan download limit is no longer hit.
    ===================================================================== */
-const SUPABASE_URL = 'PASTE_YOUR_SUPABASE_URL_HERE';       // e.g. https://abcdxyz.supabase.co
-const SUPABASE_KEY = 'PASTE_YOUR_SUPABASE_ANON_KEY_HERE';  // the public "anon" / "publishable" key
-
-const SB_TABLE = SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/dkp_snapshots';
-function sbReady() {
-  return SUPABASE_URL.startsWith('https://') && !SUPABASE_URL.includes('PASTE') && !SUPABASE_KEY.includes('PASTE');
-}
-async function sbFetch(url, init) {
-  const res = await fetch(url, {
-    cache: 'no-store',
-    ...(init || {}),
-    headers: { apikey: SUPABASE_KEY, ...((init && init.headers) || {}) },
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error('Database request failed: ' + res.status + ' ' + txt);
-  }
-  return res;
-}
-
+const DKP_BASE = DKP_KV_URL.replace(/\.json$/, '');
 const dkpMem = new Map();      // date -> { v: versionToken, data: {id: governor} }
 let dkpLastState = null;
 let dkpLastSig = '';
@@ -5092,7 +5074,7 @@ function dkpDb() {
   if (dkpDbPromise) return dkpDbPromise;
   dkpDbPromise = new Promise((resolve) => {
     try {
-      const req = indexedDB.open('xtit_dkp_cache_v2', 1);
+      const req = indexedDB.open('xtit_dkp_cache_v1', 1);
       req.onupgradeneeded = () => { try { req.result.createObjectStore('snaps'); } catch (e) {} };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => resolve(null);
@@ -5122,27 +5104,23 @@ async function dkpCacheDel(date) {
   if (!db) return;
   try { db.transaction('snaps', 'readwrite').objectStore('snaps').delete(date); } catch (e) {}
 }
-
-// Reads one snapshot straight from the database (no cache). Used to verify uploads.
-async function dkpReadSnapshotDirect(date) {
-  const res = await sbFetch(`${SB_TABLE}?select=data&date=eq.${encodeURIComponent(date)}`);
-  const rows = await res.json();
-  return rows && rows[0] ? rows[0].data : null;
+async function dkpFetchJson(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error('DKP fetch failed: ' + res.status);
+  return res.json();
 }
 
 async function loadDkpStateRemoteInner() {
   try {
-    if (!sbReady()) { console.error('Supabase URL / key not filled in App.jsx'); return null; }
-    const res = await sbFetch(`${SB_TABLE}?select=date,meta,uploaded_at&order=date.asc`);
-    const rows = await res.json();
-    const meta = {};
-    const dates = [];
-    (rows || []).forEach(r => {
-      dates.push(r.date);
-      meta[r.date] = { ...(r.meta || {}), uploadedAt: Number(r.uploaded_at) || 0 };
-    });
+    const [metaRaw, keysRaw] = await Promise.all([
+      dkpFetchJson(DKP_BASE + '/meta.json'),
+      dkpFetchJson(DKP_BASE + '/snapshots.json?shallow=true'),
+    ]);
+    const meta = metaRaw && typeof metaRaw === 'object' ? metaRaw : {};
+    const dates = keysRaw && typeof keysRaw === 'object' ? Object.keys(keysRaw).sort() : [];
     const tokenOf = d => String((meta[d] && meta[d].uploadedAt) || 'legacy');
-    const sig = dates.map(d => d + ':' + tokenOf(d)).join('|');
+    const sig = dates.map(d => d + ':' + tokenOf(d)).join('|') + '#' + JSON.stringify(meta);
     // nothing changed since the last poll -> same object, React skips re-render
     if (dkpLastState && sig === dkpLastSig) return dkpLastState;
 
@@ -5155,7 +5133,7 @@ async function loadDkpStateRemoteInner() {
         if (cached && cached.v === tok && cached.data) {
           hit = cached;
         } else {
-          const data = await dkpReadSnapshotDirect(d);
+          const data = await dkpFetchJson(DKP_BASE + '/snapshots/' + encodeURIComponent(d) + '.json');
           hit = { v: tok, data: data || {} };
           dkpCachePut(d, hit);
         }
@@ -5168,7 +5146,6 @@ async function loadDkpStateRemoteInner() {
     dkpLastSig = sig;
     return state;
   } catch (e) {
-    console.error('DKP load error:', e);
     return null;
   }
 }
@@ -5180,16 +5157,20 @@ async function loadDkpStateRemote() {
   return dkpInflight;
 }
 
-// Saves ONE date (upsert) instead of re-uploading everything.
+// Saves ONE date (snapshot + meta) instead of re-uploading everything.
 async function saveDkpSnapshotRemote(date, governors, metaEntry) {
   try {
-    if (!sbReady()) return false;
+    const key = encodeURIComponent(date);
     const uploadedAt = Date.now();
-    await sbFetch(`${SB_TABLE}?on_conflict=date`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
-      body: JSON.stringify({ date, data: governors, meta: metaEntry || {}, uploaded_at: uploadedAt }),
+    const r1 = await fetch(`${DKP_BASE}/snapshots/${key}.json`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(governors),
     });
+    if (!r1.ok) { console.error('DKP snapshot save failed:', r1.status, await r1.text().catch(() => '')); return false; }
+    const r2 = await fetch(`${DKP_BASE}/meta/${key}.json`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...metaEntry, uploadedAt }),
+    });
+    if (!r2.ok) { console.error('DKP meta save failed:', r2.status, await r2.text().catch(() => '')); return false; }
     const hit = { v: String(uploadedAt), data: governors };
     dkpMem.set(date, hit);
     dkpCachePut(date, hit);
@@ -5202,17 +5183,17 @@ async function saveDkpSnapshotRemote(date, governors, metaEntry) {
 }
 async function deleteDkpSnapshotRemote(date) {
   try {
-    if (!sbReady()) return false;
-    await sbFetch(`${SB_TABLE}?date=eq.${encodeURIComponent(date)}`, { method: 'DELETE' });
+    const key = encodeURIComponent(date);
+    const a = await fetch(`${DKP_BASE}/snapshots/${key}.json`, { method: 'DELETE' });
+    const b = await fetch(`${DKP_BASE}/meta/${key}.json`, { method: 'DELETE' });
     dkpMem.delete(date);
     dkpCacheDel(date);
     dkpLastSig = '';
-    return true;
+    return a.ok && b.ok;
   } catch (e) {
     return false;
   }
 }
-
 async function saveDkpStateRemote(state) {
   try {
     const res = await fetch(DKP_KV_URL, {
@@ -6008,7 +5989,7 @@ const file = e.target.files && e.target.files[0];
       if (saved) {
         try {
           // read straight from the database (bypasses every cache)
-          const stored = await dkpReadSnapshotDirect(uploadDate);
+          const stored = await dkpFetchJson(DKP_BASE + '/snapshots/' + encodeURIComponent(uploadDate) + '.json');
           const storedTotal = stored
             ? Object.values(stored).reduce((sum, g) => sum + (Number(g && g.helps) || 0), 0)
             : null;
