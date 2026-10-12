@@ -8120,7 +8120,28 @@ const ACTIVITY_POLL_MS = 30000;
 const ACTIVITY_COLUMN_ALIASES = {
   id:        ['character id', 'governor id', 'id'],
   username:  ['username', 'name', 'governor name'],
-  helps:     ['alliance helps', 'alliance help', 'alliance helps given', 'alliance help given', 'total alliance helps', 'total alliance help', 'total helps', 'total help', 'helps given', 'help given', 'helps', 'help'],
+  helps: [
+    'alliance helps', 'alliance help',
+    'alliance helps given', 'alliance help given',
+    'alliance helps received', 'alliance help received',
+    'alliance helps sent', 'alliance help sent',
+    'alliance help count', 'alliance help points',
+    'alliance helps count', 'alliance helps points',
+    'alliance help total', 'alliance helps total',
+    'total alliance helps', 'total alliance help',
+    'total helps', 'total help',
+    'total helps given', 'total help given',
+    'total helps received', 'total help received',
+    'helps given', 'help given',
+    'helps received', 'help received',
+    'helps sent', 'help sent',
+    'helped allies', 'allies helped',
+    'number of helps', 'number of help',
+    'help count', 'helps count',
+    'assists', 'assist count', 'assists given',
+    'alliance assists', 'alliance assist',
+    'helps', 'help',
+  ],
   resources: ['resources gathered', 'resources'],
 };
 
@@ -8142,6 +8163,32 @@ async function parseActivityFile(file) {
   Object.keys(ACTIVITY_COLUMN_ALIASES).forEach(k => {
     col[k] = findColumnIndex(header, ACTIVITY_COLUMN_ALIASES[k]);
   });
+  // Last-resort fallback: if none of the explicit helps aliases matched,
+  // scan every header for a help/assist keyword in any language our
+  // players commonly use. This catches unusual header names we haven't
+  // listed yet (localized exports, extra wording, etc.).
+  if (col.helps === -1) {
+    const HELP_RE = /help|assist|yard[iı]m|ayuda|ajuda|assist[êe]ncia|помощ|同盟|동맹|hỗ trợ|مساعدة|bantuan|hilfe|aiuto|aide|unterst/i;
+    const fallback = header.findIndex(h => {
+      const s = String(h || '');
+      if (!s) return false;
+      return HELP_RE.test(s);
+    });
+    if (fallback !== -1 && fallback !== col.id && fallback !== col.username) {
+      col.helps = fallback;
+    }
+  }
+
+  // Diagnostic — prints the exact header row + resolved column map to the
+  // browser console. If helps is still 0 after re-upload, open DevTools
+  // and read this to see what the real header name is.
+  try {
+    // eslint-disable-next-line no-console
+    console.log('[Governor parser] header row:', header);
+    // eslint-disable-next-line no-console
+    console.log('[Governor parser] resolved columns:', col);
+  } catch (e) {}
+
   if (col.id === -1 || col.username === -1) {
     throw new Error('Could not find Character ID / Username columns in this file');
   }
