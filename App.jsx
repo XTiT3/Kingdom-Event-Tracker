@@ -477,6 +477,11 @@ const TRANSLATIONS = {
     mig_tab_joined:"Joined",
     mig_tab_left:"Left",
     mig_tab_history:"History",
+    mig_period:"Detection period",
+    mig_auto:"Automatic",
+    mig_latest:"Latest upload compared",
+    mig_still:"Still in Kingdom",
+    mig_still_sub:"Present in both of the last two files",
     mig_joined:"Joined Kingdom",
     mig_left:"Left Kingdom",
     mig_unconfirmed:"Unconfirmed Departures",
@@ -10671,10 +10676,10 @@ function MigrationPanel() {
   const dates = useMemo(() => Object.keys(snapshots).sort(), [snapshots]);
 
   useEffect(() => {
-    if (dates.length === 0) return;
-    if (!fromDate || !dates.includes(fromDate)) setFromDate(dates[0]);
-    if (!toDate   || !dates.includes(toDate))   setToDate(dates[dates.length - 1]);
-  }, [dates]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Automatic: always cover the entire history
+    setFromDate('0000-01-01');
+    setToDate('9999-12-31');
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { setVisibleCount(50); }, [view, fromDate, toDate, search, sortBy]);
 
@@ -10897,18 +10902,21 @@ function MigrationPanel() {
   // Automatically save every comparison to the permanent log (owner session, so
   // the log is written right after an upload). Existing records are never removed.
   useEffect(() => {
-    if (!isOwner || !migLogLoadedRef.current || transitions.length === 0) return;
+    if (!migLogLoadedRef.current || transitions.length === 0) return;
     const sigOf = list => JSON.stringify((list || []).map(e => e.key + '|' + e.kind).sort());
     const next = { ...migLog };
     let changed = false;
     transitions.forEach(tr => {
       const old = migLog[tr.date];
       const oldEvents = old && old.events ? Object.values(old.events) : [];
-      if (!old || sigOf(tr.events) !== sigOf(oldEvents)) { next[tr.date] = tr; changed = true; }
+      // Save new dates automatically. Never overwrite an old record that
+      // was made from a different previous file (keeps history permanent).
+      if (!old) { next[tr.date] = tr; changed = true; }
+      else if (old.since === tr.since && sigOf(tr.events) !== sigOf(oldEvents)) { next[tr.date] = tr; changed = true; }
     });
     if (changed) { setMigLog(next); saveMigrationLog(next); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transitions, isOwner]);
+  }, [transitions, migLog]);
 
   // Live comparisons + saved history for dates whose snapshot no longer exists
   const fullHistory = useMemo(() => {
@@ -11068,18 +11076,9 @@ function MigrationPanel() {
 
       <div className="dkp-scan-card">
         <div className="dkp-scan-actions" style={{ flexWrap: 'wrap' }}>
-          <label className="muted-line" style={{ margin: 0 }}>
-            {t('from_label')}{' '}
-            <select className="dkp-name-input" style={{ display: 'inline-block', width: 'auto' }} value={fromDate} onChange={e => setFromDate(e.target.value)}>
-              {dates.map(d => <option key={d} value={d}>{d}</option>)}
-            </select>
-          </label>
-          <label className="muted-line" style={{ margin: 0 }}>
-            {t('to_label')}{' '}
-            <select className="dkp-name-input" style={{ display: 'inline-block', width: 'auto' }} value={toDate} onChange={e => setToDate(e.target.value)}>
-              {dates.map(d => <option key={d} value={d}>{d}</option>)}
-            </select>
-          </label>
+          <span className="muted-line" style={{ margin: 0 }}>
+            {t('mig_period')}: {dates[0]} → {dates[dates.length - 1]} · {t('mig_auto')}
+          </span>
           {isList && (
             <>
               <label className="muted-line" style={{ margin: 0 }}>
@@ -11131,13 +11130,43 @@ function MigrationPanel() {
             </div>
           </div>
 
-          <div className="dkp-summary-grid">
-            <div className="dkp-summary-card">
-              <span className="dkp-summary-label">{t('mig_current')}</span>
-              <span className="dkp-summary-value">{formatCount(stats.current)}</span>
-              <span className="dkp-summary-sub">{t('mig_current_sub')}</span>
-            </div>
-          </div>
+          {(() => {
+            const lastTr = transitions[transitions.length - 1];
+            const latestD = validDates[validDates.length - 1];
+            const prevD = validDates[validDates.length - 2];
+            const latestSnap = (latestD && snapshots[latestD]) || {};
+            const prevSnap = (prevD && snapshots[prevD]) || {};
+            const stillCount = Object.keys(latestSnap).filter(id => prevSnap[id]).length;
+            return (
+              <>
+                {lastTr && (
+                  <p className="muted-line" style={{ marginBottom: 8 }}>
+                    {t('mig_latest')}: <b>{lastTr.since} → {lastTr.date}</b>
+                  </p>
+                )}
+                <div className="dkp-summary-grid">
+                  <div className="dkp-summary-card">
+                    <span className="dkp-summary-label">{t('mig_joined')}</span>
+                    <span className="dkp-summary-value" style={{ color: 'var(--live)' }}>+{formatCount(lastTr ? lastTr.joined : 0)}</span>
+                  </div>
+                  <div className="dkp-summary-card">
+                    <span className="dkp-summary-label">{t('mig_left')}</span>
+                    <span className="dkp-summary-value" style={{ color: 'var(--danger)' }}>−{formatCount(lastTr ? lastTr.left : 0)}</span>
+                  </div>
+                  <div className="dkp-summary-card">
+                    <span className="dkp-summary-label">{t('mig_still')}</span>
+                    <span className="dkp-summary-value">{formatCount(stillCount)}</span>
+                    <span className="dkp-summary-sub">{t('mig_still_sub')}</span>
+                  </div>
+                  <div className="dkp-summary-card dkp-summary-top">
+                    <span className="dkp-summary-label">{t('mig_current')}</span>
+                    <span className="dkp-summary-value accent">{formatCount(stats.current)}</span>
+                    <span className="dkp-summary-sub">{t('mig_current_sub')}</span>
+                  </div>
+                </div>
+              </>
+            );
+          })()}
           <p className="muted-line" style={{ fontSize: '0.78rem' }}>{t('mig_note_v3')}</p>
           {validDates.length < dates.length && (
             <p className="muted-line" style={{ color: 'var(--accent-strong)', fontSize: '0.8rem' }}>
