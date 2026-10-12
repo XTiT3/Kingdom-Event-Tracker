@@ -10585,7 +10585,7 @@ const MigrationIcon = p => (
 );
 
 const OUR_KINGDOM_ID = '4161';
-const MIG_VERDICT_URL = 'https://xtit-dkp-tracker-default-rtdb.firebaseio.com/migration_verdicts';
+// MIG_VERDICT_URL removed — Migration is fully automatic.
 const MIG_LOG_URL = 'https://xtit-dkp-tracker-default-rtdb.firebaseio.com/migration_log.json';
 
 async function loadMigrationLog() {
@@ -10607,24 +10607,7 @@ async function saveMigrationLog(log) {
   } catch (e) { return false; }
 }
 
-async function loadMigrationVerdicts() {
-  try {
-    const res = await fetch(MIG_VERDICT_URL + '.json', { cache: 'no-store' });
-    if (!res.ok) throw new Error('verdict fetch failed');
-    const d = await res.json();
-    return d && typeof d === 'object' ? d : {};
-  } catch (e) { return null; }
-}
-async function saveMigrationVerdict(id, verdict) {
-  try {
-    const res = await fetch(`${MIG_VERDICT_URL}/${encodeURIComponent(id)}.json`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(verdict),
-    });
-    return res.ok;
-  } catch (e) { return false; }
-}
+// (Migration is fully automatic now — no manual verdicts to load/save.)
 // A snapshot entry counts as "foreign" only if it explicitly names another kingdom.
 function isForeignKingdom(entry) {
   const k = String((entry && entry.kingdom) || '').replace(/\D/g, '');
@@ -10634,21 +10617,10 @@ function isForeignKingdom(entry) {
 function MigrationPanel() {
   const { t } = useT();
   const { isOwner } = useOwner();
-  const [verdicts, setVerdicts]   = useState({});   // { [id]: 'left' | 'stayed' }
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      const v = await loadMigrationVerdicts();
-      if (!cancelled && v) setVerdicts(v);
-    };
-    load();
-    const id = setInterval(load, DKP_POLL_MS);
-    return () => { cancelled = true; clearInterval(id); };
-  }, []);
-  const setVerdict = async (id, verdict) => {
-    setVerdicts(v => ({ ...v, [id]: verdict }));
-    await saveMigrationVerdict(id, verdict);
-  };
+  // Fully automatic — no manual verdicts.
+  // A departure is only marked as CONFIRMED when a later snapshot lists
+  // the governor under a different kingdom (Kingdom column). Otherwise
+  // the governor is shown as an Unconfirmed potential departure.
   const [snapshots, setSnapshots] = useState({});
   const [loaded, setLoaded]       = useState(false);
   const [failed, setFailed]       = useState(false);
@@ -10869,16 +10841,18 @@ function MigrationPanel() {
       const suspect = raw.length / base > 0.2;
       const events = [];
       raw.forEach(e => {
-        const verdict = verdicts[e.id];
         if (e.type === 'join') {
-          if (seenEarlier(e.id, i) && verdict !== 'left') return; // returning after a gap, not a migration
+          // Automatically confirmed: the ID was never seen in any earlier
+          // snapshot — it is genuinely new to the kingdom.
+          if (seenEarlier(e.id, i)) return; // returning after a data gap, not a migration
           e.kind = 'join';
           e.confirmed = true;
         } else {
-          if (verdict === 'stayed') return;
           const later = laterEntries(e.id, i);
-          if (verdict === 'left' || later.some(isForeignKingdom)) { e.kind = 'left'; e.confirmed = true; }
-          else if (later.length > 0) return; // reappears later, not a departure
+          // Automatically confirmed departure: a later snapshot lists
+          // them under another kingdom. Otherwise it stays unconfirmed.
+          if (later.some(isForeignKingdom)) { e.kind = 'left'; e.confirmed = true; }
+          else if (later.length > 0) return; // reappears later in OUR kingdom, not a departure
           else { e.kind = 'unconfirmed'; e.confirmed = false; }
         }
         const key = e.id + '|' + e.type + '|' + validDates[i];
@@ -10894,7 +10868,7 @@ function MigrationPanel() {
       });
     }
     return out;
-  }, [snapshots, validDates, verdicts]);
+  }, [snapshots, validDates]);
 
   const lowD  = fromDate && toDate ? (fromDate < toDate ? fromDate : toDate) : '';
   const highD = fromDate && toDate ? (fromDate < toDate ? toDate : fromDate) : '';
@@ -11016,14 +10990,7 @@ function MigrationPanel() {
               {e.kind === 'left' && !e.confirmed && (
                 <span className="tag" title="Missing from later list. Not confirmed as a kingdom departure.">Missing from later list</span>
               )}
-              {isOwner && e.kind === 'unconfirmed' && (
-                <>
-                  <button type="button" className="dkp-btn-danger" style={{ padding: '3px 10px', fontSize: '0.68rem' }}
-                    onClick={() => setVerdict(e.id, 'left')}>{t('mig_confirm_left')}</button>
-                  <button type="button" className="dkp-btn-secondary" style={{ padding: '3px 10px', fontSize: '0.68rem' }}
-                    onClick={() => setVerdict(e.id, 'stayed')}>{t('mig_still_here')}</button>
-                </>
-              )}
+              {/* Departures are confirmed automatically from the Kingdom column. */}
             </span>
             <span className="mig-num">{e.id}</span>
             <span className="mig-num">{formatCount(e.power)}</span>
