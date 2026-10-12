@@ -5334,6 +5334,7 @@ const COLUMN_ALIASES = {
   highest:   ['highest power'],
   kp:        ['total kill points', 'kill points', 'kp'],
   resources: ['resources gathered', 'resources'],
+  helps:     ['alliance helps', 'alliance help', 'helps'],
   t5k:       ['t5 kills', 'tier 5 kills'],
   t4k:       ['t4 kills', 'tier 4 kills'],
   t3k:       ['t3 kills', 'tier 3 kills'],
@@ -5385,6 +5386,7 @@ async function parseGovernorFile(file) {
     highest:   findColumnIndex(header, COLUMN_ALIASES.highest),
     kp:        findColumnIndex(header, COLUMN_ALIASES.kp),
     resources: findColumnIndex(header, COLUMN_ALIASES.resources),
+    helps:     findColumnIndex(header, COLUMN_ALIASES.helps),
     t5k:       findColumnIndex(header, COLUMN_ALIASES.t5k),
     t4k:       findColumnIndex(header, COLUMN_ALIASES.t4k),
     t3k:       findColumnIndex(header, COLUMN_ALIASES.t3k),
@@ -5425,6 +5427,7 @@ async function parseGovernorFile(file) {
       highest:   col.highest   !== -1 ? toNum(r[col.highest])   : 0,
       kp:        col.kp        !== -1 ? toNum(r[col.kp])        : 0,
       resources: col.resources !== -1 ? toNum(r[col.resources]) : 0,
+      helps:     col.helps     !== -1 ? toNum(r[col.helps])     : 0,
       t5k:       col.t5k       !== -1 ? toNum(r[col.t5k])       : 0,
       t4k:       col.t4k       !== -1 ? toNum(r[col.t4k])       : 0,
       t3k:       col.t3k       !== -1 ? toNum(r[col.t3k])       : 0,
@@ -8213,19 +8216,13 @@ function ActivityPanel() {
   const { t } = useT();
   const { isOwner, requireOwnerLogin } = useOwner();
   const [tab, setTab]                 = useState('farms');
-  const [snapshots, setSnapshots]     = useState({});   // { date: { players: [] } }
+  const [dkpState, setDkpState]       = useState({ snapshots: {}, meta: {} });
   const [fromDate, setFromDate]       = useState('');
   const [toDate, setToDate]           = useState('');
   const [loaded, setLoaded]           = useState(false);
-  const [uploadDate, setUploadDate]   = useState(() => toISODate(new Date()));
-  const [uploading, setUploading]     = useState(false);
-  const [msg, setMsg]                 = useState(null);
-  const [deletePrompt, setDeletePrompt] = useState(null); // { date }
-  const [deleting, setDeleting]         = useState(false);
   const [search, setSearch]           = useState('');
   const [sortKey, setSortKey]         = useState('helpsGained');
   const [visibleCount, setVisibleCount] = useState(50);
-  const fileRef = useRef(null);
   const tableScrollRef = useRef(null);
   const slideLockRef = useRef(false);
 
@@ -8239,28 +8236,41 @@ function ActivityPanel() {
     setTimeout(() => { slideLockRef.current = false; }, 260);
   };
 
-  // Load shared snapshots, keep polling so everyone sees new uploads
+  // Read the SAME snapshots the DKP tab uses — no separate upload here.
+  // Governor files uploaded in the DKP section automatically appear here.
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      const remote = await loadActivityRemote();
+      const remote = await loadDkpStateRemote();
       if (cancelled || !remote) return;
-      setSnapshots(remote.snapshots || {});
+      setDkpState(remote);
       setLoaded(true);
     };
     load();
-    const id = setInterval(load, ACTIVITY_POLL_MS);
+    const id = setInterval(load, DKP_POLL_MS);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
+  const snapshots = dkpState.snapshots || {};
   const dates = useMemo(() => Object.keys(snapshots).sort(), [snapshots]);
 
-  // { date: { id: player } } so the migration tracker can look a player up on any date
+  // The DKP snapshot shape is { date: { id: governorEntry } }. Convert it
+  // to the { id: player } map the migration tracker expects.
   const playerMaps = useMemo(() => {
     const m = {};
     Object.keys(snapshots).forEach(d => {
-      const arr = snapshots[d] && Array.isArray(snapshots[d].players) ? snapshots[d].players : [];
-      m[d] = Object.fromEntries(arr.map(p => [p.id, p]));
+      const govs = snapshots[d] || {};
+      const mapped = {};
+      Object.values(govs).forEach(g => {
+        if (!g || !g.id) return;
+        mapped[g.id] = {
+          id: g.id,
+          name: g.username || '',
+          helps: Number(g.helps) || 0,
+          resources: Number(g.resources) || 0,
+        };
+      });
+      m[d] = mapped;
     });
     return m;
   }, [snapshots]);
@@ -8282,21 +8292,8 @@ function ActivityPanel() {
 
   useEffect(() => { setVisibleCount(50); }, [search, sortKey, fromDate, toDate]);
 
-  const actSnapListRef = useCallback((el) => {
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [dates.length]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const fromPlayers = useMemo(() => {
-    const snap = snapshots[fromDate];
-    const arr = snap && Array.isArray(snap.players) ? snap.players : [];
-    return Object.fromEntries(arr.map(p => [p.id, p]));
-  }, [snapshots, fromDate]);
-
-  const toPlayers = useMemo(() => {
-    const snap = snapshots[toDate];
-    const arr = snap && Array.isArray(snap.players) ? snap.players : [];
-    return Object.fromEntries(arr.map(p => [p.id, p]));
-  }, [snapshots, toDate]);
+  const fromPlayers = useMemo(() => playerMaps[fromDate] || {}, [playerMaps, fromDate]);
+  const toPlayers   = useMemo(() => playerMaps[toDate]   || {}, [playerMaps, toDate]);
 
   const rows = useMemo(() => {
     // every player who appears in ANY snapshot between From and To (migrants included)
@@ -8339,52 +8336,7 @@ function ActivityPanel() {
     resources: rows.reduce((s, r) => s + (r.resources || 0), 0),
   }), [rows]);
 
-  const triggerUpload = () => { if (fileRef.current) fileRef.current.click(); };
 
-  const performDeleteActivity = async (dateToRemove) => {
-    setDeleting(true);
-    const fresh = await loadActivityRemote();
-    if (!fresh) { setDeleting(false); setDeletePrompt(null); return; }
-    const next = { ...fresh.snapshots };
-    delete next[dateToRemove];
-    setSnapshots(next);
-    if (fromDate === dateToRemove) setFromDate('');
-    if (toDate   === dateToRemove) setToDate('');
-    await saveActivityRemote({ snapshots: next });
-    setDeleting(false);
-    setDeletePrompt(null);
-  };
-
-  const onFileChosen = async e => {
-    const file = e.target.files && e.target.files[0];
-    e.target.value = '';
-    if (!file) return;
-    setUploading(true);
-    setMsg(null);
-    try {
-      const { players: newPlayers, missingHelps, missingResources } = await parseActivityFile(file);
-      const fresh = await loadActivityRemote();
-      if (!fresh) throw new Error('Could not reach the database. Nothing was changed, try again.');
-      const next = { ...fresh.snapshots, [uploadDate]: { players: newPlayers } };
-      setSnapshots(next);
-      // Auto-update To (and From if empty) so the user immediately sees their new upload
-      setToDate(uploadDate);
-      if (!fromDate) setFromDate(uploadDate);
-      setLoaded(true);
-      const saved = await saveActivityRemote({ snapshots: next });
-      const loadedText = t('activity_loaded')
-        .replace('{count}', formatCount(newPlayers.length))
-        .replace('{date}', uploadDate);
-      const notes = (missingHelps ? t('activity_missing_helps') : '') + (missingResources ? t('activity_missing_resources') : '');
-      setMsg(saved
-        ? { type: 'success', text: loadedText + notes }
-        : { type: 'error', text: t('activity_save_failed') });
-    } catch (err) {
-      setMsg({ type: 'error', text: err.message || t('msg_could_not_read') });
-    } finally {
-      setUploading(false);
-    }
-  };
 
   const fmtGained = (v) => {
     if (v === null || v === undefined) return '—';
@@ -8412,66 +8364,7 @@ function ActivityPanel() {
 
       {tab === 'farms' && (
         <>
-          {isOwner ? (
-            <div className="dkp-scan-card">
-              <div className="dkp-scan-top"><span className="pill upcoming">{t('owner_only')}</span></div>
-              <p className="dkp-scan-desc">{t('activity_upload_desc')}</p>
-              <div className="dkp-scan-actions">
-                <input
-                  type="date" className="dkp-name-input"
-                  value={uploadDate} onChange={e => setUploadDate(e.target.value)}
-                />
-                <button className="btn-primary" type="button" onClick={triggerUpload} disabled={uploading}>
-                  {uploading ? t('activity_uploading') : t('activity_upload_btn')}
-                </button>
-                <input
-                  ref={fileRef} type="file" accept=".xlsx,.xls,.csv"
-                  style={{ display: 'none' }} onChange={onFileChosen}
-                />
-              </div>
-              {msg && (
-                <p className="muted-line" style={{ color: msg.type === 'error' ? 'var(--danger)' : 'var(--live)', marginTop: 10, marginBottom: 0 }}>
-                  {msg.text}
-                </p>
-              )}
-            </div>
-          ) : (
-            <button type="button" className="act-owner-link" onClick={() => requireOwnerLogin()}>
-              {t('activity_owner_login')}
-            </button>
-          )}
 
-          {/* Snapshot list — owner can delete */}
-          {dates.length > 0 && (
-            <div className="dkp-scan-card">
-              <div className="dkp-scan-top" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span className="pill done">{t('snapshots_label')}</span>
-                <span className="muted-line" style={{ margin: 0, fontSize: '0.75rem' }}>{dates.length} {t('total_suffix')}</span>
-              </div>
-              <div className="dkp-snapshot-list" ref={actSnapListRef}>
-                {dates.map(d => (
-                  <div key={d} className="dkp-snapshot-item">
-                    <span className="dkp-snapshot-date" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d}</span>
-                    </span>
-                    <span className="dkp-snapshot-count">
-                      {formatCount((snapshots[d].players || []).length)} {t('governors_suffix')}
-                    </span>
-                    {isOwner && (
-                      <button
-                        className="dkp-snapshot-remove"
-                        type="button"
-                        onClick={() => setDeletePrompt({ date: d })}
-                        title={t('title_remove').replace('{date}', d)}
-                      >
-                        <Icon.close width={14} height={14} />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
 
           {/* Filter bar — From / To / Sort By / Search */}
           {dates.length > 0 && (
@@ -8598,30 +8491,6 @@ function ActivityPanel() {
       )}
 
       {tab === 'fort' && <FortPanel />}
-
-      {deletePrompt && (
-        <div className="modal-overlay" onClick={() => setDeletePrompt(null)}>
-          <div className="modal-card" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>{t('confirm_action_title')}</h3>
-              <button className="modal-x" onClick={() => setDeletePrompt(null)}>
-                <Icon.close width={16} height={16}/>
-              </button>
-            </div>
-            <div className="modal-body">
-              <p className="modal-prompt">
-                {t('confirm_remove_snapshot').replace('{date}', deletePrompt.date)}
-              </p>
-              <div className="modal-actions">
-                <button className="btn-secondary" onClick={() => setDeletePrompt(null)}>{t('cancel_btn')}</button>
-                <button className="btn-danger" onClick={() => performDeleteActivity(deletePrompt.date)} disabled={deleting}>
-                  {t('remove_btn')}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -11021,9 +10890,9 @@ function MigrationPanel() {
   if (dates.length === 0) return <p className="muted-line">{t('mig_no_data')}</p>;
   if (dates.length < 2) return <p className="muted-line">{t('mig_need_two')}</p>;
 
-  const isList = view === 'joined' || view === 'left' || view === 'unconfirmed';
+  const isList = view === 'joined' || view === 'left';
   const currentList = isList
-    ? listFor(view === 'joined' ? 'join' : view === 'left' ? 'left' : 'unconfirmed')
+    ? listFor(view === 'joined' ? 'join' : 'left')
     : [];
   const maxBar = Math.max(1, ...rangeTransitions.map(tr => Math.max(tr.joined, tr.left)));
 
@@ -11034,7 +10903,6 @@ function MigrationPanel() {
           ['dashboard', 'mig_tab_dashboard'],
           ['joined',    'mig_tab_joined'],
           ['left',      'mig_tab_left'],
-          ['unconfirmed', 'mig_tab_unconfirmed'],
           ['history',   'mig_tab_history'],
         ].map(([id, key]) => (
           <button
@@ -11117,11 +10985,6 @@ function MigrationPanel() {
               <span className="dkp-summary-label">{t('mig_total')}</span>
               <span className="dkp-summary-value">{formatCount(stats.total)}</span>
               <span className="dkp-summary-sub">{formatCount(stats.unique)} {t('mig_unique')}</span>
-            </div>
-            <div className="dkp-summary-card">
-              <span className="dkp-summary-label">{t('mig_unconfirmed')}</span>
-              <span className="dkp-summary-value" style={{ color: 'var(--accent-strong)' }}>{formatCount(stats.unconfirmed)}</span>
-              <span className="dkp-summary-sub">{t('mig_unconfirmed_note')}</span>
             </div>
           </div>
 
