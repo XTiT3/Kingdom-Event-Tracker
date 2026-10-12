@@ -10647,11 +10647,7 @@ function MigrationPanel() {
 
   const dates = useMemo(() => Object.keys(snapshots).sort(), [snapshots]);
 
-  useEffect(() => {
-    // Automatic: always cover the entire history
-    setFromDate('0000-01-01');
-    setToDate('9999-12-31');
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // (From / To are auto-populated below, once validDates is computed.)
 
   useEffect(() => { setVisibleCount(50); }, [view, fromDate, toDate, search, sortBy]);
 
@@ -10809,6 +10805,16 @@ function MigrationPanel() {
     });
     return out;
   }, [snapshots, dates]);
+
+  // Auto-pick the earliest and latest valid snapshots as the initial
+  // From / To range. The user can override either one with the pickers.
+  useEffect(() => {
+    if (validDates.length === 0) return;
+    const fromValid = fromDate && validDates.includes(fromDate);
+    const toValid   = toDate   && validDates.includes(toDate);
+    if (!fromValid) setFromDate(validDates[0]);
+    if (!toValid)   setToDate(validDates[validDates.length - 1]);
+  }, [validDates]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Compare every valid upload with the previous valid upload.
   // kind: 'join' | 'left' (confirmed) | 'unconfirmed' (potential departure)
@@ -11043,9 +11049,28 @@ function MigrationPanel() {
 
       <div className="dkp-scan-card">
         <div className="dkp-scan-actions" style={{ flexWrap: 'wrap' }}>
-          <span className="muted-line" style={{ margin: 0 }}>
-            {t('mig_period')}: {dates[0]} → {dates[dates.length - 1]} · {t('mig_auto')}
-          </span>
+          <label className="muted-line" style={{ margin: 0 }}>
+            {t('from_label')}{' '}
+            <select
+              className="dkp-name-input"
+              style={{ display: 'inline-block', width: 'auto' }}
+              value={fromDate}
+              onChange={e => setFromDate(e.target.value)}
+            >
+              {validDates.map(d => (<option key={d} value={d}>{d}</option>))}
+            </select>
+          </label>
+          <label className="muted-line" style={{ margin: 0 }}>
+            {t('to_label')}{' '}
+            <select
+              className="dkp-name-input"
+              style={{ display: 'inline-block', width: 'auto' }}
+              value={toDate}
+              onChange={e => setToDate(e.target.value)}
+            >
+              {validDates.map(d => (<option key={d} value={d}>{d}</option>))}
+            </select>
+          </label>
           {isList && (
             <>
               <label className="muted-line" style={{ margin: 0 }}>
@@ -11067,6 +11092,9 @@ function MigrationPanel() {
             </>
           )}
         </div>
+        <p className="muted-line" style={{ margin: '8px 0 0', fontSize: '0.78rem' }}>
+          {t('mig_period')}: {fromDate || '—'} → {toDate || '—'} · {t('mig_auto')}
+        </p>
       </div>
 
       {view === 'dashboard' && (
