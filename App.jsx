@@ -488,6 +488,12 @@ const TRANSLATIONS = {
     mig_note_v2:"Leaving an alliance is not leaving the kingdom. A player counts as Left Kingdom only if a later snapshot lists them under another kingdom (Kingdom column) or the owner confirmed it. Players who simply disappear from the files are Unconfirmed, and players who reappear in a later file are ignored. The files contain no alliance, city or destination-kingdom data, so add a Kingdom column to the exports for automatic confirmation.",
     mig_net:"Net Migration",
     mig_total:"Total Migration Activity",
+    mig_current:"Current Kingdom Players",
+    mig_current_sub:"In latest valid upload",
+    mig_confirmed:"confirmed",
+    mig_potential:"potential",
+    mig_note_v3:"Each valid upload is automatically compared with the previous valid upload. New IDs count as Joined, missing IDs count as Left. A missing player is a potential departure unless a later file lists them under another kingdom or the owner confirms it. Players present in both files are never counted. Each event is counted once.",
+    mig_invalid_note:"{n} upload(s) were skipped as incomplete or invalid (empty, no data, or under half the size of the previous valid file) and are not used for migration.",
     mig_unique:"unique players",
     mig_loading:"Loading migration data…",
     mig_load_failed:"Could not load snapshots. Check your connection and try again.",
@@ -10652,6 +10658,7 @@ function MigrationPanel() {
 
   useEffect(() => { setVisibleCount(50); }, [view, fromDate, toDate, search, sortBy]);
 
+  /* OLD DUPLICATE BLOCK — disabled
   // Compare every pair of consecutive snapshots.
   // kind: 'join' | 'left' (confirmed kingdom departure) | 'unconfirmed' (missing, not provable)
   const transitions = useMemo(() => {
@@ -10772,6 +10779,112 @@ function MigrationPanel() {
       suspect: events.filter(e => e.suspect).length,
     };
   }, [events]);
+  */
+
+  // A snapshot is "valid" if it has players with real data and is not a
+  // partial file (less than half the size of the previous valid snapshot).
+  const validDates = useMemo(() => {
+    const out = [];
+    let lastCount = 0;
+    dates.forEach(d => {
+      const snap = snapshots[d] || {};
+      const ids = Object.keys(snap);
+      if (ids.length === 0) return;
+      const hasData = ids.some(id => snap[id] && ((snap[id].power || 0) > 0 || (snap[id].kp || 0) > 0));
+      if (!hasData) return;
+      if (lastCount > 0 && ids.length < lastCount * 0.5) return;
+      out.push(d);
+      lastCount = ids.length;
+    });
+    return out;
+  }, [snapshots, dates]);
+
+  // Compare every valid upload with the previous valid upload.
+  // kind: 'join' | 'left' (confirmed) | 'unconfirmed' (potential departure)
+  const transitions = useMemo(() => {
+    const out = [];
+    const seen = new Set(); // prevents counting the same event twice
+    const laterEntries = (id, idx) => {
+      const list = [];
+      for (let j = idx + 1; j < validDates.length; j++) {
+        const en = (snapshots[validDates[j]] || {})[id];
+        if (en) list.push(en);
+      }
+      return list;
+    };
+    const seenEarlier = (id, idx) => {
+      for (let j = 0; j < idx - 1; j++) if ((snapshots[validDates[j]] || {})[id]) return true;
+      return false;
+    };
+    for (let i = 1; i < validDates.length; i++) {
+      const prev = snapshots[validDates[i - 1]] || {};
+      const cur  = snapshots[validDates[i]] || {};
+      const raw = [];
+      Object.keys(cur).forEach(id => {
+        if (!prev[id]) raw.push({ type: 'join', id, name: cur[id].username, power: cur[id].power || 0 });
+      });
+      Object.keys(prev).forEach(id => {
+        if (!cur[id]) raw.push({ type: 'left', id, name: prev[id].username, power: prev[id].power || 0 });
+      });
+      const base = Math.max(Object.keys(prev).length, Object.keys(cur).length, 1);
+      const suspect = raw.length / base > 0.2;
+      const events = [];
+      raw.forEach(e => {
+        const verdict = verdicts[e.id];
+        if (e.type === 'join') {
+          if (seenEarlier(e.id, i) && verdict !== 'left') return; // returning after a gap, not a migration
+          e.kind = 'join';
+          e.confirmed = true;
+        } else {
+          if (verdict === 'stayed') return;
+          const later = laterEntries(e.id, i);
+          if (verdict === 'left' || later.some(isForeignKingdom)) { e.kind = 'left'; e.confirmed = true; }
+          else if (later.length > 0) return; // reappears later, not a departure
+          else { e.kind = 'unconfirmed'; e.confirmed = false; }
+        }
+        const key = e.id + '|' + e.type + '|' + validDates[i];
+        if (seen.has(key)) return;
+        seen.add(key);
+        events.push({ ...e, date: validDates[i], since: validDates[i - 1], suspect, key });
+      });
+      out.push({
+        date: validDates[i], since: validDates[i - 1], events, suspect,
+        joined:      events.filter(e => e.kind === 'join').length,
+        left:        events.filter(e => e.kind !== 'join').length,
+        unconfirmed: events.filter(e => e.kind === 'unconfirmed').length,
+      });
+    }
+    return out;
+  }, [snapshots, validDates, verdicts]);
+
+  const lowD  = fromDate && toDate ? (fromDate < toDate ? fromDate : toDate) : '';
+  const highD = fromDate && toDate ? (fromDate < toDate ? toDate : fromDate) : '';
+
+  // Date filter: every comparison that happened between the selected dates
+  const rangeTransitions = useMemo(
+    () => transitions.filter(tr => tr.date > lowD && tr.date <= highD),
+    [transitions, lowD, highD]
+  );
+  const events = useMemo(() => {
+    if (!lowD || !highD || lowD === highD) return [];
+    return rangeTransitions.flatMap(tr => tr.events);
+  }, [rangeTransitions, lowD, highD]);
+
+  const stats = useMemo(() => {
+    const joined = events.filter(e => e.kind === 'join').length;
+    const confirmedLeft = events.filter(e => e.kind === 'left').length;
+    const unconfirmed = events.filter(e => e.kind === 'unconfirmed').length;
+    const left = confirmedLeft + unconfirmed;
+    const latest = validDates[validDates.length - 1];
+    return {
+      joined, left, confirmedLeft, unconfirmed,
+      net: joined - left,
+      total: joined + left,
+      unique: new Set(events.map(e => e.id)).size,
+      suspect: events.filter(e => e.suspect).length,
+      current: latest ? Object.keys(snapshots[latest] || {}).length : 0,
+    };
+  }, [events, validDates, snapshots]);
 
   const movesById = useMemo(() => {
     const m = {};
@@ -10791,7 +10904,7 @@ function MigrationPanel() {
   const listFor = (type) => {
     const q = search.trim().toLowerCase();
     return events
-      .filter(e => e.kind === type && (!q || String(e.name || '').toLowerCase().includes(q) || String(e.id).includes(q)))
+      .filter(e => (type === 'left' ? e.kind !== 'join' : e.kind === type) && (!q ||String(e.name || '').toLowerCase().includes(q) || String(e.id).includes(q)))
       .sort(sortFn);
   };
 
@@ -10827,7 +10940,7 @@ function MigrationPanel() {
               {e.kind === 'left' && !e.confirmed && (
                 <span className="tag" title="Missing from later list. Not confirmed as a kingdom departure.">Missing from later list</span>
               )}
-              {isOwner && e.kind === 'left' && !e.confirmed && (
+              {isOwner && e.kind === 'unconfirmed' && (
                 <>
                   <button type="button" className="dkp-btn-danger" style={{ padding: '3px 10px', fontSize: '0.68rem' }}
                     onClick={() => setVerdict(e.id, 'left')}>{t('mig_confirm_left')}</button>
@@ -10932,6 +11045,7 @@ function MigrationPanel() {
             <div className="dkp-summary-card">
               <span className="dkp-summary-label">{t('mig_left')}</span>
               <span className="dkp-summary-value" style={{ color: 'var(--danger)' }}>−{formatCount(stats.left)}</span>
+              <span className="dkp-summary-sub">{formatCount(stats.confirmedLeft)} {t('mig_confirmed')} · {formatCount(stats.unconfirmed)} {t('mig_potential')}</span>
             </div>
             <div className="dkp-summary-card dkp-summary-top">
               <span className="dkp-summary-label">{t('mig_net')}</span>
@@ -10949,7 +11063,19 @@ function MigrationPanel() {
             </div>
           </div>
 
-          <p className="muted-line" style={{ fontSize: '0.78rem' }}>{t('mig_note_v2')}</p>
+          <div className="dkp-summary-grid">
+            <div className="dkp-summary-card">
+              <span className="dkp-summary-label">{t('mig_current')}</span>
+              <span className="dkp-summary-value">{formatCount(stats.current)}</span>
+              <span className="dkp-summary-sub">{t('mig_current_sub')}</span>
+            </div>
+          </div>
+          <p className="muted-line" style={{ fontSize: '0.78rem' }}>{t('mig_note_v3')}</p>
+          {validDates.length < dates.length && (
+            <p className="muted-line" style={{ color: 'var(--accent-strong)', fontSize: '0.8rem' }}>
+              {t('mig_invalid_note').replace('{n}', formatCount(dates.length - validDates.length))}
+            </p>
+          )}
           {stats.suspect > 0 && (
             <p className="muted-line" style={{ color: 'var(--accent-strong)', fontSize: '0.8rem' }}>
               {t('mig_suspect_note').replace('{n}', formatCount(stats.suspect))}
